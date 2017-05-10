@@ -6,6 +6,7 @@ import com.cloudbees.plugins.credentials.CredentialsProvider;
 import com.cloudbees.plugins.credentials.common.StandardUsernameCredentials;
 import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.model.Bind;
+import com.github.dockerjava.api.model.HostConfig;
 import com.github.dockerjava.api.model.LxcConf;
 import com.github.dockerjava.api.model.PortBinding;
 import com.github.dockerjava.api.model.Volume;
@@ -358,6 +359,8 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase> {
         Map<String,String> map = new HashMap<>();
         map.put("JenkinsId", JenkinsUtils.getInstanceId());
 
+        HostConfig hostConfig = containerConfig.getHostConfig();
+        hostConfig.withShmSize( 512L * 1024 * 1024 );
 
         containerConfig.withLabels(map);
 
