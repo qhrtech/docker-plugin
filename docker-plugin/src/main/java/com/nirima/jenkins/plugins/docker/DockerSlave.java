@@ -3,7 +3,7 @@ package com.nirima.jenkins.plugins.docker;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.PushImageCmd;
 import com.github.dockerjava.api.exception.DockerException;
-import com.github.dockerjava.api.model.AuthConfig;
+import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.Identifier;
 import com.github.dockerjava.api.model.PushResponseItem;
 import com.github.dockerjava.core.NameParser;
@@ -26,16 +26,15 @@ import hudson.slaves.ComputerLauncher;
 import hudson.slaves.NodeProperty;
 import hudson.slaves.RetentionStrategy;
 import jenkins.model.Jenkins;
+import org.jenkinsci.plugins.docker.commons.credentials.DockerRegistryEndpoint;
 import org.jenkinsci.plugins.tokenmacro.TokenMacro;
 
 import javax.annotation.CheckForNull;
 import java.io.IOException;
-import java.util.Collections;
 import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
-import static com.nirima.jenkins.plugins.docker.utils.JenkinsUtils.getAuthConfigFor;
 import static com.nirima.jenkins.plugins.docker.utils.LogUtils.printResponseItemToListener;
 import static org.apache.commons.lang.StringUtils.isEmpty;
 
@@ -96,7 +95,7 @@ public class DockerSlave extends AbstractCloudSlave {
                 template.getLabelString(),
                 launcher,
                 template.getRetentionStrategyCopy(),
-                Collections.<NodeProperty<?>>emptyList()
+                template.getNodeProperties()
         );
         this.cloudId = cloud.getDisplayName();
         this.dockerTemplate = template;
@@ -202,6 +201,8 @@ public class DockerSlave extends AbstractCloudSlave {
                             .withTimeout(10)
                             .exec();
                     LOGGER.log(Level.INFO, "Stopped container {0}", getContainerId());
+                } catch(NotFoundException e) {
+                    LOGGER.log(Level.INFO, "Container already removed {0}", getContainerId());
                 } catch (Exception ex) {
                     LOGGER.log(Level.SEVERE, "Failed to stop instance " + getContainerId() + " for slave " + name + " due to exception", ex.getMessage());
                     LOGGER.log(Level.SEVERE, "Causing exception for failure on stopping the instance was", ex);
@@ -225,7 +226,9 @@ public class DockerSlave extends AbstractCloudSlave {
                             .exec();
 
                     LOGGER.log(Level.INFO, "Removed container {0}", getContainerId());
-                } catch (Exception ex) {
+                } catch (NotFoundException e) {
+                    LOGGER.log(Level.INFO, "Container already gone.");
+                }catch (Exception ex) {
                     LOGGER.log(Level.SEVERE, "Failed to remove instance " + getContainerId() + " for slave " + name + " due to exception: " + ex.getMessage());
                     LOGGER.log(Level.SEVERE, "Causing exception for failre on removing instance was", ex);
                 }
@@ -285,10 +288,8 @@ public class DockerSlave extends AbstractCloudSlave {
                     try {
 
                         PushImageCmd cmd = getClient().pushImageCmd(identifier);
-                        AuthConfig authConfig = getAuthConfigFor(tagToken);
-                        if( authConfig != null ) {
-                            cmd.withAuthConfig(authConfig);
-                        }
+                        final DockerRegistryEndpoint registry = dockerTemplate.getRegistry();
+                        DockerCloud.setRegistryAuthentication(cmd, registry, Jenkins.getInstance());
                         cmd.exec(resultCallback).awaitSuccess();
 
                     } catch(DockerException ex) {
@@ -331,7 +332,7 @@ public class DockerSlave extends AbstractCloudSlave {
      * Add a built on docker action.
      */
     private void addJenkinsAction(String tag_image) throws IOException {
-        theRun.addAction(new DockerBuildAction(getCloud().getServerUrl(), containerId, tag_image, dockerTemplate.remoteFsMapping));
+        theRun.addAction(new DockerBuildAction(getCloud().getDockerHost().getUri(), containerId, tag_image, dockerTemplate.remoteFsMapping));
         theRun.save();
     }
 

@@ -11,6 +11,7 @@ import com.github.dockerjava.api.model.LxcConf;
 import com.github.dockerjava.api.model.PortBinding;
 import com.github.dockerjava.api.model.Volume;
 import com.github.dockerjava.api.model.VolumesFrom;
+import com.github.dockerjava.core.NameParser;
 import com.google.common.base.Function;
 import com.google.common.base.Joiner;
 import com.google.common.base.Objects;
@@ -22,6 +23,7 @@ import com.trilead.ssh2.Connection;
 import hudson.Extension;
 import hudson.model.Describable;
 import hudson.model.Descriptor;
+import hudson.model.Item;
 import hudson.model.ItemGroup;
 import hudson.plugins.sshslaves.SSHLauncher;
 import hudson.security.ACL;
@@ -31,6 +33,7 @@ import hudson.util.ListBoxModel;
 import jenkins.model.Jenkins;
 import org.apache.commons.collections.CollectionUtils;
 import org.apache.commons.lang.StringUtils;
+import org.jenkinsci.plugins.docker.commons.credentials.DockerRegistryEndpoint;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
@@ -54,6 +57,9 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase> {
     private static final Logger LOGGER = Logger.getLogger(DockerTemplateBase.class.getName());
 
     private String image;
+
+    private String pullCredentialsId;
+    private transient DockerRegistryEndpoint registry;
 
     /**
      * Field dockerCommand
@@ -108,6 +114,7 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase> {
 
     @DataBoundConstructor
     public DockerTemplateBase(String image,
+                              String pullCredentialsId,
                               String dnsString,
                               String network,
                               String dockerCommand,
@@ -126,6 +133,7 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase> {
                               String macAddress
     ) {
         setImage(image);
+        this.pullCredentialsId = pullCredentialsId;
         this.dockerCommand = dockerCommand;
         this.lxcConfString = lxcConfString;
         this.privileged = privileged;
@@ -157,6 +165,9 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase> {
                 setVolumesFrom2(new String[]{volumesFrom});
             }
             volumesFrom = null;
+        }
+        if (pullCredentialsId == null && registry != null) {
+            pullCredentialsId = registry.getCredentialsId();
         }
 
         return this;
@@ -206,6 +217,18 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase> {
 
     public String getImage() {
         return image.trim();
+    }
+
+    public String getPullCredentialsId() {
+        return pullCredentialsId;
+    }
+
+    public DockerRegistryEndpoint getRegistry() {
+        if (registry == null) {
+            registry = new DockerRegistryEndpoint(null, pullCredentialsId);
+        }
+
+        return registry;
     }
 
     public String getDnsString() {
@@ -466,6 +489,12 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase> {
         return (DescriptorImpl) Jenkins.getInstance().getDescriptor(DockerTemplateBase.class);
     }
 
+    public String getFullImageId() {
+        NameParser.ReposTag repostag = NameParser.parseRepositoryTag(image);
+        // if image was specified without tag, then treat as latest
+        return repostag.repos + ":" + (repostag.tag.isEmpty() ? "latest" : repostag.tag);
+    }
+
     @Extension
     public static class DescriptorImpl extends Descriptor<DockerTemplateBase> {
 
@@ -521,6 +550,14 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase> {
             }
 
             return FormValidation.ok();
+        }
+
+
+        public ListBoxModel doFillPullCredentialsIdItems(@AncestorInPath Item item) {
+            final DockerRegistryEndpoint.DescriptorImpl descriptor =
+                    (DockerRegistryEndpoint.DescriptorImpl)
+                            Jenkins.getInstance().getDescriptorOrDie(DockerRegistryEndpoint.class);
+            return descriptor.doFillCredentialsIdItems(item);
         }
 
 

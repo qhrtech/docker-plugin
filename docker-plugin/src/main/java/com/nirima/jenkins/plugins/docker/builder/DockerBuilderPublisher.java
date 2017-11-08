@@ -3,7 +3,6 @@ package com.nirima.jenkins.plugins.docker.builder;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.PushImageCmd;
 import com.github.dockerjava.api.exception.DockerException;
-import com.github.dockerjava.api.model.AuthConfig;
 import com.github.dockerjava.api.model.AuthConfigurations;
 import com.github.dockerjava.api.model.BuildResponseItem;
 import com.github.dockerjava.api.model.Identifier;
@@ -12,6 +11,7 @@ import com.github.dockerjava.core.DockerClientConfig;
 import com.github.dockerjava.core.NameParser;
 import com.github.dockerjava.core.command.BuildImageResultCallback;
 import com.github.dockerjava.core.command.PushImageResultCallback;
+import com.github.dockerjava.core.dockerfile.Dockerfile;
 import com.google.common.base.Joiner;
 import com.google.common.base.Optional;
 import com.google.common.base.Splitter;
@@ -29,17 +29,23 @@ import hudson.FilePath;
 import hudson.Launcher;
 import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
-import hudson.model.Descriptor;
+import hudson.model.Item;
 import hudson.model.TaskListener;
+import hudson.remoting.RemoteInputStream;
 import hudson.remoting.VirtualChannel;
+import hudson.slaves.Cloud;
 import hudson.tasks.BuildStepDescriptor;
 import hudson.tasks.Builder;
 import hudson.util.FormValidation;
+import hudson.util.ListBoxModel;
 import jenkins.MasterToSlaveFileCallable;
+import jenkins.model.Jenkins;
 import jenkins.tasks.SimpleBuildStep;
 import org.apache.commons.lang.Validate;
+import org.jenkinsci.plugins.docker.commons.credentials.DockerRegistryEndpoint;
 import org.jenkinsci.plugins.tokenmacro.MacroEvaluationException;
 import org.jenkinsci.plugins.tokenmacro.TokenMacro;
+import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.QueryParameter;
 import org.slf4j.Logger;
@@ -48,20 +54,19 @@ import org.slf4j.LoggerFactory;
 import javax.annotation.CheckForNull;
 import java.io.File;
 import java.io.IOException;
-import java.io.PrintStream;
+import java.io.InputStream;
 import java.io.Serializable;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.regex.Pattern;
 
-import static com.nirima.jenkins.plugins.docker.utils.JenkinsUtils.getAuthConfigFor;
-import static com.nirima.jenkins.plugins.docker.utils.JenkinsUtils.getAuthConfigurations;
 import static com.nirima.jenkins.plugins.docker.utils.LogUtils.printResponseItemToListener;
 import static org.apache.commons.lang.StringUtils.isEmpty;
 
 /**
  * Builder extension to build / publish an image from a Dockerfile.
+ * TODO automatic migration to https://wiki.jenkins.io/display/JENKINS/CloudBees+Docker+Build+and+Publish+plugin
  */
 public class DockerBuilderPublisher extends Builder implements Serializable, SimpleBuildStep {
 
@@ -105,6 +110,9 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
 
     public final String dockerFileDirectory;
 
+    private String pullCredentialsId;
+    private transient DockerRegistryEndpoint fromRegistry;
+
     /**
      * @deprecated use {@link #tags}
      */
@@ -115,6 +123,10 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
     private List<String> tags;
 
     public final boolean pushOnSuccess;
+
+    private String pushCredentialsId;
+    private transient DockerRegistryEndpoint registry;
+
     public final boolean cleanImages;
     public final boolean cleanupWithJenkinsJobDelete;
 
@@ -122,18 +134,37 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
 
     @DataBoundConstructor
     public DockerBuilderPublisher(String dockerFileDirectory,
+                                  String pullCredentialsId,
                                   String cloud,
                                   String tagsString,
                                   boolean pushOnSuccess,
+                                  String pushCredentialsId,
                                   boolean cleanImages,
                                   boolean cleanupWithJenkinsJobDelete) {
         this.dockerFileDirectory = dockerFileDirectory;
+        this.pullCredentialsId = pullCredentialsId;
         setTagsString(tagsString);
         this.tag = null;
         this.cloud = cloud;
         this.pushOnSuccess = pushOnSuccess;
+        this.pushCredentialsId = pushCredentialsId;
         this.cleanImages = cleanImages;
         this.cleanupWithJenkinsJobDelete = cleanupWithJenkinsJobDelete;
+    }
+
+    public DockerRegistryEndpoint getRegistry() {
+        if (registry == null) {
+            registry = new DockerRegistryEndpoint(null, pushCredentialsId);
+        }
+        return registry;
+    }
+
+    public String getPullCredentialsId() {
+        return pullCredentialsId;
+    }
+
+    public String getPushCredentialsId() {
+        return pushCredentialsId;
     }
 
     public List<String> getTags() {
@@ -150,6 +181,13 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
 
     public void setTagsString(String tagsString) {
         setTags(filterStringToList(tagsString));
+    }
+
+    public DockerRegistryEndpoint getFromRegistry() {
+        if (fromRegistry == null) {
+            fromRegistry = new DockerRegistryEndpoint(null, pullCredentialsId);
+        }
+        return fromRegistry;
     }
 
     public static List<String> filterStringToList(String str) {
@@ -169,7 +207,7 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
             // So we do some fake substitution to help prevent incorrect complaints.
             final String expandedTag = verifyTag.replaceAll("\\$\\{[^}]*NUMBER\\}", "1234").replaceAll("\\$\\{[^}]*\\}", "xyz");
             if (!VALID_REPO_PATTERN.matcher(expandedTag).matches()) {
-                throw new IllegalArgumentException("Tag " + verifyTag + " doesn't match "+ VALID_REPO_REGEX);
+                throw new IllegalArgumentException("Tag " + verifyTag + " doesn't match " + VALID_REPO_REGEX);
             }
         }
     }
@@ -178,7 +216,7 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
 
         DockerCloud theCloud;
 
-        if( !Strings.isNullOrEmpty(cloud) ) {
+        if (!Strings.isNullOrEmpty(cloud)) {
             theCloud = JenkinsUtils.getServer(cloud);
         } else {
 
@@ -190,11 +228,11 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
         }
 
         // Triton can't do docker build. Ensure we're not trying to do that.
-        if( theCloud.isTriton() ) {
+        if (theCloud.isTriton()) {
             LOGGER.warn("Selected cloud for build does not support this feature. Finding an alternative");
 
-            for(DockerCloud dc : JenkinsUtils.getServers()) {
-                if( !dc.isTriton() ) {
+            for (DockerCloud dc : JenkinsUtils.getServers()) {
+                if (!dc.isTriton()) {
                     LOGGER.warn("Picked {} cloud instead", dc.getDisplayName());
                     return dc;
                 }
@@ -220,7 +258,7 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
         final DockerClientConfig clientConfig;
         final DockerCmdExecConfig dockerCmdExecConfig;
 
-        final transient hudson.model.Run<?,?> run;
+        final transient hudson.model.Run<?, ?> run;
 
         final String url;
 
@@ -236,11 +274,11 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
 
             // Don't build it yet. This may happen on a remote server.
             clientConfig = ClientConfigBuilderForPlugin.dockerClientConfig()
-                   .forCloud(dockerCloud).build();
+                    .forCloud(dockerCloud).build();
             dockerCmdExecConfig = DockerCmdExecConfigBuilderForPlugin.builder()
                     .forCloud(dockerCloud).build();
 
-            url = dockerCloud.getServerUrl();
+            url = dockerCloud.getDockerHost().getUri();
 
         }
 
@@ -263,8 +301,7 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
         }
 
         boolean run() throws IOException, InterruptedException {
-            final PrintStream llog = listener.getLogger();
-            llog.println("Docker Build");
+            log("Docker Build");
 
             String imageId = buildImage();
 
@@ -273,14 +310,14 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
                 return false;
             }
 
-            llog.println("Docker Build Response : " + imageId);
+            log("Docker Build Response : " + imageId);
 
             // Add an action to the build
             run.addAction(new DockerBuildImageAction(url, imageId, tagsToUse, cleanupWithJenkinsJobDelete, pushOnSuccess));
             run.save();
 
             if (pushOnSuccess) {
-                llog.println("Pushing " + tagsToUse);
+                log("Pushing " + tagsToUse);
                 pushImages();
             }
 
@@ -288,16 +325,16 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
                 // For some reason, docker delete doesn't delete all tagged
                 // versions, despite force = true.
                 // So, do it multiple times (protect against infinite looping).
-                llog.println("Cleaning local images [" + imageId + "]");
+                log("Cleaning local images [" + imageId + "]");
 
                 try {
                     cleanImages(imageId);
                 } catch (Exception ex) {
-                    llog.println("Error attempting to clean images");
+                    log("Error attempting to clean images");
                 }
             }
 
-            llog.println("Docker Build Done");
+            log("Docker Build Done");
 
             return true;
         }
@@ -309,55 +346,58 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
         }
 
         private String buildImage() throws IOException, InterruptedException {
-            final AuthConfigurations authConfigurations = getAuthConfigurations();
-            return fpChild.act(new MasterToSlaveFileCallable<String>() {
-                public String invoke(File f, VirtualChannel channel) throws IOException, InterruptedException {
+            final AuthConfigurations auths = new AuthConfigurations();
+            final DockerRegistryEndpoint pullRegistry = getFromRegistry();
+            if (pullRegistry != null && pullRegistry.getCredentialsId() != null) {
+                auths.addConfig(DockerCloud.getAuthConfig(pullRegistry, run.getParent().getParent()));
+            }
 
-                    log("Docker Build: building image at path " + f.getAbsolutePath());
-                    BuildImageResultCallback resultCallback = new BuildImageResultCallback() {
-                        public void onNext(BuildResponseItem item) {
-                            String text = item.getStream();
-                            if (text != null) {
-                                log(text);
-                            }
-                            super.onNext(item);
-                        }
-                    };
-                    String imageId = getClient().buildImageCmd(f)
-                            .withBuildAuthConfigs(authConfigurations)
-                            .exec(resultCallback)
-                            .awaitImageId();
+            final DockerClient client = getClient();
 
-                    if (imageId == null) {
-                        throw new AbortException("Built image id is null. Some error accured");
+            log("Docker Build: building image at path " + fpChild.getRemote());
+            final InputStream tar = fpChild.act(new DockerBuildCallable());
+
+
+            BuildImageResultCallback resultCallback = new BuildImageResultCallback() {
+                public void onNext(BuildResponseItem item) {
+                    String text = item.getStream();
+                    if (text != null) {
+                        listener.getLogger().println(text);
                     }
-
-                    // tag built image with tags
-                    for (String tag : tagsToUse) {
-                        final NameParser.ReposTag reposTag = NameParser.parseRepositoryTag(tag);
-                        final String commitTag = isEmpty(reposTag.tag) ? "latest" : reposTag.tag;
-                        log("Tagging built image with " + reposTag.repos + ":" + commitTag);
-                        getClient().tagImageCmd(imageId, reposTag.repos, commitTag).withForce().exec();
-                    }
-
-                    return imageId;
+                    super.onNext(item);
                 }
-            });
+            };
+            String imageId = client.buildImageCmd(tar)
+                    .withBuildAuthConfigs(auths)
+                    .exec(resultCallback)
+                    .awaitImageId();
+
+            if (imageId == null) {
+                throw new AbortException("Built image id is null. Some error accured");
+            }
+
+            // tag built image with tags
+            for (String tag : tags) {
+                final NameParser.ReposTag reposTag = NameParser.parseRepositoryTag(tag);
+                final String commitTag = isEmpty(reposTag.tag) ? "latest" : reposTag.tag;
+                log("Tagging built image with " + reposTag.repos + ":" + commitTag);
+                client.tagImageCmd(imageId, reposTag.repos, commitTag).withForce().exec();
+            }
+
+            return imageId;
         }
 
-        protected void log(String s)
-        {
-            final PrintStream llog = listener.getLogger();
-            llog.println(s);
+        protected void log(String s) {
+            listener.getLogger().println(s);
         }
 
 
-        private void pushImages() {
+        private void pushImages() throws IOException {
             for (String tagToUse : tagsToUse) {
                 Identifier identifier = Identifier.fromCompoundString(tagToUse);
                 PushImageResultCallback resultCallback = new PushImageResultCallback() {
                     public void onNext(PushResponseItem item) {
-                        if( item == null ) {
+                        if (item == null) {
                             // docker-java not happy if you pass it nulls.
                             log("Received NULL Push Response. Ignoring");
                             return;
@@ -368,12 +408,9 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
                 };
                 try {
                     PushImageCmd cmd = getClient().pushImageCmd(identifier);
-                    AuthConfig authConfig = getAuthConfigFor(tagToUse);
-                    if( authConfig != null ) {
-                        cmd.withAuthConfig(authConfig);
-                    }
+                    DockerCloud.setRegistryAuthentication(cmd, getRegistry(), run.getParent().getParent());
                     cmd.exec(resultCallback).awaitSuccess();
-                } catch(DockerException ex) {
+                } catch (DockerException ex) {
                     // Private Docker registries fall over regularly. Tell the user so they
                     // have some clue as to what to do as the exception gives no hint.
                     log("Exception pushing docker image. Check that the destination registry is running.");
@@ -381,8 +418,13 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
                 }
             }
         }
+    }
 
+    private static class DockerBuildCallable extends MasterToSlaveFileCallable<InputStream> {
 
+        public InputStream invoke(File f, VirtualChannel channel) throws IOException, InterruptedException {
+            return new RemoteInputStream(new Dockerfile(new File(f, "Dockerfile"), f).parse().buildDockerFolderTar(), RemoteInputStream.Flag.GREEDY);
+        }
 
     }
 
@@ -391,12 +433,12 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
 
         List<String> expandedTags;
 
-        if( run instanceof AbstractBuild) {
+        if (run instanceof AbstractBuild) {
             expandedTags = expandTags((AbstractBuild<?, ?>) run, launcher, listener);
         } else {
-            expandedTags =  tags;
+            expandedTags = tags;
         }
-        new Run(run, launcher, listener,new FilePath(workspace, dockerFileDirectory), expandedTags, getCloud(launcher)).run();
+        new Run(run, launcher, listener, new FilePath(workspace, dockerFileDirectory), expandedTags, getCloud(launcher)).run();
 
     }
 
@@ -431,6 +473,32 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
             return FormValidation.ok();
         }
 
+        public ListBoxModel doFillPullCredentialsIdItems(@AncestorInPath Item item) {
+            return doFillRegistryCredentialsIdItems(item);
+        }
+
+        public ListBoxModel doFillPushCredentialsIdItems(@AncestorInPath Item item) {
+            return doFillRegistryCredentialsIdItems(item);
+        }
+
+        private ListBoxModel doFillRegistryCredentialsIdItems(@AncestorInPath Item item) {
+            final DockerRegistryEndpoint.DescriptorImpl descriptor =
+                    (DockerRegistryEndpoint.DescriptorImpl)
+                    Jenkins.getInstance().getDescriptorOrDie(DockerRegistryEndpoint.class);
+            return descriptor.doFillCredentialsIdItems(item);
+        }
+
+        public ListBoxModel doFillCloudItems() {
+            ListBoxModel model = new ListBoxModel();
+            model.add("Cloud this build is running on", "");
+            for (Cloud cloud : DockerCloud.instances()) {
+                model.add(cloud.name);
+            }
+            return model;
+        }
+
+
+
         @Override
         public boolean isApplicable(Class<? extends AbstractProject> jobType) {
             return true;
@@ -441,4 +509,18 @@ public class DockerBuilderPublisher extends Builder implements Serializable, Sim
             return "Build / Publish Docker Image";
         }
     }
+
+
+    private Object readResolve() {
+        if (pushCredentialsId == null && registry != null) {
+            pushCredentialsId = registry.getCredentialsId();
+        }
+        if (pullCredentialsId == null && fromRegistry != null) {
+            pullCredentialsId = fromRegistry.getCredentialsId();
+        }
+        return this;
+    }
+
 }
+
+

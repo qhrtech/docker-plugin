@@ -5,9 +5,13 @@
         <span class="info">Prerequisites:</span> Docker image must have <a href="https://www.openssh.com/">sshd</a> installed.
     </f:block>
 
-    <f:block>
-        Master identity RSA public key is injected in container for SSH authentication. If you use a non standard
-        sshd you might need to create a key pair and configure docker container and credentials accordingly.
-    </f:block>
+    <f:entry field="useSSHKey" title="inject SSH key">
+        <f:checkbox default="true"/>
+    </f:entry>
+
+    <f:entry field="user" title="connect as user">
+        <f:textbox default="root"/>
+    </f:entry>
+
     <f:property field="sshConnector"/>
 </j:jelly>

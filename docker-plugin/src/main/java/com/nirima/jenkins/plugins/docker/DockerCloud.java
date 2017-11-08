@@ -1,49 +1,56 @@
 package com.nirima.jenkins.plugins.docker;
 
+import com.cloudbees.plugins.credentials.Credentials;
 import com.cloudbees.plugins.credentials.CredentialsMatchers;
 import com.cloudbees.plugins.credentials.CredentialsProvider;
-import com.cloudbees.plugins.credentials.common.StandardCertificateCredentials;
+import com.cloudbees.plugins.credentials.common.IdCredentials;
 import com.cloudbees.plugins.credentials.common.StandardListBoxModel;
+import com.cloudbees.plugins.credentials.common.StandardUsernameListBoxModel;
+import com.cloudbees.plugins.credentials.common.StandardUsernamePasswordCredentials;
 import com.cloudbees.plugins.credentials.domains.DomainRequirement;
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.command.CreateContainerResponse;
 import com.github.dockerjava.api.command.PullImageCmd;
+import com.github.dockerjava.api.command.PushImageCmd;
 import com.github.dockerjava.api.command.StartContainerCmd;
+import com.github.dockerjava.api.exception.DockerClientException;
 import com.github.dockerjava.api.exception.DockerException;
+import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.AuthConfig;
 import com.github.dockerjava.api.model.Container;
-import com.github.dockerjava.api.model.Image;
 import com.github.dockerjava.api.model.Version;
 import com.github.dockerjava.core.DockerClientConfig;
-import com.github.dockerjava.core.NameParser;
 import com.github.dockerjava.core.command.PullImageResultCallback;
 import com.google.common.base.Objects;
-import com.google.common.base.Preconditions;
-import com.google.common.base.Predicate;
 import com.google.common.base.Throwables;
-import com.google.common.collect.Iterables;
 import com.nirima.jenkins.plugins.docker.client.ClientBuilderForPlugin;
 import com.nirima.jenkins.plugins.docker.client.ClientConfigBuilderForPlugin;
 import com.nirima.jenkins.plugins.docker.client.DockerCmdExecConfig;
 import com.nirima.jenkins.plugins.docker.client.DockerCmdExecConfigBuilderForPlugin;
-import com.nirima.jenkins.plugins.docker.launcher.DockerComputerLauncher;
-import com.nirima.jenkins.plugins.docker.utils.DockerDirectoryCredentials;
-import com.nirima.jenkins.plugins.docker.utils.JenkinsUtils;
 import hudson.Extension;
 import hudson.model.Computer;
 import hudson.model.Descriptor;
 import hudson.model.ItemGroup;
 import hudson.model.Label;
 import hudson.model.Node;
+import hudson.model.TaskListener;
 import hudson.security.ACL;
 import hudson.security.AccessControlled;
 import hudson.slaves.Cloud;
 import hudson.slaves.NodeProvisioner;
 import hudson.util.FormValidation;
 import hudson.util.ListBoxModel;
-import io.jenkins.docker.DockerSlaveProvisioner;
+import io.jenkins.docker.connector.DockerComputerConnector;
+import jenkins.authentication.tokens.api.AuthenticationTokens;
 import jenkins.model.Jenkins;
+import org.apache.commons.codec.binary.Base64;
+import org.jenkinsci.plugins.docker.commons.credentials.DockerRegistryEndpoint;
+import org.jenkinsci.plugins.docker.commons.credentials.DockerRegistryToken;
+import org.jenkinsci.plugins.docker.commons.credentials.DockerServerCredentials;
+import org.jenkinsci.plugins.docker.commons.credentials.DockerServerEndpoint;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
@@ -55,12 +62,15 @@ import javax.annotation.CheckForNull;
 import javax.servlet.ServletException;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.concurrent.Callable;
+import java.util.logging.Level;
+
+import static com.cloudbees.plugins.credentials.CredentialsMatchers.firstOrNull;
+import static com.cloudbees.plugins.credentials.CredentialsMatchers.withId;
 
 /**
  * Docker Cloud configuration. Contains connection configuration,
@@ -74,11 +84,17 @@ public class DockerCloud extends Cloud {
 
     private List<DockerTemplate> templates;
     private transient HashMap<Long, DockerTemplate> jobTemplates;
-    private String serverUrl;
+
+    private DockerServerEndpoint dockerHost;
+
+    @Deprecated
+    private transient String serverUrl;
+    @Deprecated
+    public  transient String credentialsId;
+
     private int connectTimeout;
     public final int readTimeout;
     public final String version;
-    public final String credentialsId;
     public final String dockerHostname;
 
     private transient DockerClient connection;
@@ -109,6 +125,45 @@ public class DockerCloud extends Cloud {
      */
     private Boolean exposeDockerHost;
 
+
+    @DataBoundConstructor
+    public DockerCloud(String name,
+                       List<? extends DockerTemplate> templates,
+                       DockerServerEndpoint dockerHost,
+                       int containerCap,
+                       int connectTimeout,
+                       int readTimeout,
+                       String version,
+                       String dockerHostname) {
+        super(name);
+        this.version = version;
+        this.dockerHost = dockerHost;
+        this.connectTimeout = connectTimeout;
+        this.readTimeout = readTimeout;
+        this.dockerHostname = dockerHostname;
+
+        if (templates != null) {
+            this.templates = new ArrayList<>(templates);
+        } else {
+            this.templates = new ArrayList<>();
+        }
+
+        setContainerCap(containerCap);
+    }
+
+    @Deprecated
+    public DockerCloud(String name,
+                       List<? extends DockerTemplate> templates,
+                       String serverUrl,
+                       int containerCap,
+                       int connectTimeout,
+                       int readTimeout,
+                       String credentialsId,
+                       String version,
+                       String dockerHostname) {
+        this(name, templates, new DockerServerEndpoint(serverUrl, credentialsId), containerCap, connectTimeout, readTimeout, version, dockerHostname);
+    }
+
     @Deprecated
     public DockerCloud(String name,
                        List<? extends DockerTemplate> templates,
@@ -119,62 +174,24 @@ public class DockerCloud extends Cloud {
                        String credentialsId,
                        String version,
                        String dockerHostname) {
-        super(name);
-        Preconditions.checkNotNull(serverUrl);
-        this.version = version;
-        this.credentialsId = credentialsId;
-        this.serverUrl = sanitizeUrl(serverUrl);
-        this.connectTimeout = connectTimeout;
-        this.readTimeout = readTimeout;
-        this.dockerHostname = dockerHostname;
-
-        if (templates != null) {
-            this.templates = new ArrayList<>(templates);
-        } else {
-            this.templates = Collections.emptyList();
-        }
-
-        if (containerCapStr.equals("")) {
-            setContainerCap(Integer.MAX_VALUE);
-        } else {
-            setContainerCap(Integer.parseInt(containerCapStr));
-        }
+        this(name, templates, serverUrl,
+                containerCapStr.equals("") ? Integer.MAX_VALUE : Integer.parseInt(containerCapStr),
+                connectTimeout, readTimeout, credentialsId, version, dockerHostname);
     }
 
-    @DataBoundConstructor
-    public DockerCloud(String name,
-                       List<? extends DockerTemplate> templates,
-                       String serverUrl,
-                       int containerCap,
-                       int connectTimeout,
-                       int readTimeout,
-                       String credentialsId,
-                       String version,
-                       String dockerHostname) {
-        super(name);
-        Preconditions.checkNotNull(serverUrl);
-        this.version = version;
-        this.credentialsId = credentialsId;
-        this.serverUrl = sanitizeUrl(serverUrl);
-        this.connectTimeout = connectTimeout;
-        this.readTimeout = readTimeout;
-        this.dockerHostname = dockerHostname;
-
-        if (templates != null) {
-            this.templates = new ArrayList<>(templates);
-        } else {
-            this.templates = Collections.emptyList();
-        }
-
-        setContainerCap(containerCap);
-    }
 
     public int getConnectTimeout() {
         return connectTimeout;
     }
 
+
+    public DockerServerEndpoint getDockerHost() {
+        return dockerHost;
+    }
+
+    @Deprecated
     public String getServerUrl() {
-        return serverUrl;
+        return getDockerHost().getUri();
     }
 
     public String getDockerHostname() {
@@ -250,7 +267,7 @@ public class DockerCloud extends Cloud {
     @Override
     public synchronized Collection<NodeProvisioner.PlannedNode> provision(Label label, int excessWorkload) {
         try {
-            LOGGER.info("Asked to provision {} slave(s) for: {}", new Object[]{excessWorkload, label});
+            LOGGER.info("Asked to provision {} slave(s) for: {}", excessWorkload, label);
 
             List<NodeProvisioner.PlannedNode> r = new ArrayList<>();
 
@@ -275,22 +292,22 @@ public class DockerCloud extends Cloud {
                 }
 
                 r.add(new NodeProvisioner.PlannedNode(
-                                t.getDockerTemplateBase().getDisplayName(),
-                                Computer.threadPoolForRemoting.submit(new Callable<Node>() {
-                                    public Node call() throws Exception {
-                                        try {
-                                            return provisionWithWait(t);
-                                        } catch (Exception ex) {
-                                            LOGGER.error("Error in provisioning; template='{}' for cloud='{}'",
-                                                    t, getDisplayName(), ex);
-                                            throw Throwables.propagate(ex);
-                                        } finally {
-                                            decrementAmiSlaveProvision(t.getDockerTemplateBase().getImage());
-                                        }
-                                    }
-                                }),
-                                t.getNumExecutors())
-                );
+                        t.getDockerTemplateBase().getDisplayName(),
+                        Computer.threadPoolForRemoting.submit(new Callable<Node>() {
+                            public Node call() throws Exception {
+                                try {
+                                    // TODO where can we log provisioning progress ?
+                                    return provisionFromTemplate(t, TaskListener.NULL);
+                                } catch (Exception ex) {
+                                    LOGGER.error("Error in provisioning; template='{}' for cloud='{}'",
+                                            t, getDisplayName(), ex);
+                                    throw Throwables.propagate(ex);
+                                } finally {
+                                    decrementAmiSlaveProvision(t.getDockerTemplateBase().getImage());
+                                }
+                            }
+                        }),
+                        t.getNumExecutors()));
 
                 excessWorkload -= t.getNumExecutors();
             }
@@ -307,8 +324,7 @@ public class DockerCloud extends Cloud {
      * for publishers/builders. Simply runs container in docker cloud
      */
     public static String runContainer(DockerTemplateBase dockerTemplateBase,
-                                      DockerClient dockerClient,
-                                      DockerComputerLauncher launcher) {
+                                      DockerClient dockerClient) {
         CreateContainerCmd containerConfig = dockerClient.createContainerCmd(dockerTemplateBase.getImage());
 
         dockerTemplateBase.fillContainerConfig(containerConfig);
@@ -324,106 +340,74 @@ public class DockerCloud extends Cloud {
         return containerId;
     }
 
-    protected boolean shouldPullImage(String imageName, DockerImagePullStrategy pullStrategy) {
+    private void pullImage(DockerTemplate template) throws IOException, InterruptedException {
 
-        NameParser.ReposTag repostag = NameParser.parseRepositoryTag(imageName);
-        // if image was specified without tag, then treat as latest
-        final String fullImageName = repostag.repos + ":" + (repostag.tag.isEmpty() ? "latest" : repostag.tag);
+        String image = template.getFullImageId();
+        final DockerClient client = getClient();
 
-        // simply check without asking docker
-        if (pullStrategy.pullIfExists(fullImageName) && pullStrategy.pullIfNotExists(fullImageName)) {
-            return true;
-        }
-
-        if (!pullStrategy.pullIfExists(fullImageName) && !pullStrategy.pullIfNotExists(fullImageName)) {
-            return false;
-        }
-
-        List<Image> images = getClient().listImagesCmd().exec();
-
-        boolean imageExists = Iterables.any(images, new Predicate<Image>() {
-            @Override
-            public boolean apply(Image image) {
-                if (image == null || image.getRepoTags() == null) {
-                    return false;
-                } else {
-                    return Arrays.asList(image.getRepoTags()).contains(fullImageName);
-                }
-            }
-        });
-
-        return imageExists ?
-                pullStrategy.pullIfExists(fullImageName) :
-                pullStrategy.pullIfNotExists(fullImageName);
-    }
-
-    private void pullImage(DockerTemplate dockerTemplate)  throws IOException {
-
-        final String imageName = dockerTemplate.getDockerTemplateBase().getImage();
-
-        if (shouldPullImage(imageName, dockerTemplate.getPullStrategy())) {
-            LOGGER.info("Pulling image '{}'. This may take awhile...", imageName);
+        if (template.getPullStrategy().shouldPullImage(client, image)) {
+            // TODO create a FlyWeightTask so end-user get visibility on pull operation progress
+            LOGGER.info("Pulling image '{}'. This may take awhile...", image);
 
             long startTime = System.currentTimeMillis();
 
-            PullImageCmd imgCmd =  getClient().pullImageCmd(imageName);
-            AuthConfig authConfig = JenkinsUtils.getAuthConfigFor(imageName);
-            if( authConfig != null ) {
-                imgCmd.withAuthConfig(authConfig);
+            PullImageCmd cmd =  client.pullImageCmd(image);
+            final DockerRegistryEndpoint registry = template.getRegistry();
+            setRegistryAuthentication(cmd, registry, Jenkins.getInstance());
+            cmd.exec(new PullImageResultCallback()).awaitCompletion();
+
+            try {
+                client.inspectImageCmd(image).exec();
+            } catch (NotFoundException e) {
+                throw new DockerClientException("Could not pull image: " + image, e);
             }
-            imgCmd.exec(new PullImageResultCallback()).awaitSuccess();
+
             long pullTime = System.currentTimeMillis() - startTime;
-            LOGGER.info("Finished pulling image '{}', took {} ms", imageName, pullTime);
+            LOGGER.info("Finished pulling image '{}', took {} ms", image, pullTime);
         }
+
     }
 
-    private DockerSlave provisionWithWait(DockerTemplate template) throws IOException, Descriptor.FormException, InterruptedException {
+    private DockerSlave provisionFromTemplate(DockerTemplate template, TaskListener listener) throws IOException, Descriptor.FormException, InterruptedException {
 
-        final DockerSlaveProvisioner provisioner = template.getProvisioner(this);
-        return provisioner.provision();
-
-        /*
+        final DockerClient client = getClient();
+        final DockerComputerConnector connector = template.getConnector();
         pullImage(template);
 
+        LOGGER.info("Trying to run container for {}", template.getImage());
+        CreateContainerCmd cmd = client.createContainerCmd(template.getImage());
+        template.fillContainerConfig(cmd);
 
+        connector.beforeContainerCreated(this, template, cmd);
 
-        LOGGER.info("Trying to run container for {}", template.getDockerTemplateBase().getImage());
-        final String containerId = runContainer(template, getClient(), template.getLauncher());
-
-        InspectContainerResponse ir;
-        try {
-            ir = getClient().inspectContainerCmd(containerId).exec();
-        } catch (DockerException ex) {
-            getClient().removeContainerCmd(containerId).withForce(true).exec();
-            throw ex;
-        }
-
-        // Build a description up:
-        String nodeDescription = "Docker Node [" + template.getDockerTemplateBase().getImage() + " on ";
-        try {
-            nodeDescription += getDisplayName();
-        } catch (Exception ex) {
-            nodeDescription += "???";
-        }
-        nodeDescription += "]";
-
-        String slaveName = containerId.substring(0, 12);
+        String containerId = cmd.exec().getId();
 
         try {
-            slaveName = getDisplayName() + "-" + slaveName;
-        } catch (Exception ex) {
-            LOGGER.warn("Error fetching cloud name");
+            connector.beforeContainerStarted(this, template, containerId);
+
+            client.startContainerCmd(containerId).exec();
+
+            connector.afterContainerStarted(this, template, containerId);
+        } catch (DockerException e) {
+            // if something went wrong, cleanup aborted container
+            client.removeContainerCmd(containerId).withForce(true).exec();
+            throw e;
         }
 
-        template.getLauncher().waitUp(getDisplayName(), template, ir);
+        DockerSlave slave = new DockerSlave(template, containerId,
+                name + '-' + containerId.substring(0,12),
+                "Docker Agent [" + template.getImage() + " on "+ name + "]",
+                template.getRemoteFs(),
+                template.getNumExecutors(),
+                template.getMode(),
+                template.getLabelString(),
+                connector.launch(this, containerId, template, listener),
+                template.getRetentionStrategyCopy(),
+                template.getNodeProperties());
 
-        final ComputerLauncher launcher = template.getLauncher().getPreparedLauncher(getDisplayName(), template, ir);
-
-        if( isSwarm() ) {
-            return new DockerSwarmSlave(this, ir, slaveName, nodeDescription, launcher, containerId, template, getDisplayName());
-        } else {
-            return new DockerSlave(slaveName, nodeDescription, launcher, containerId, template, getDisplayName());
-        }           */
+        slave.setContainerId(containerId);
+        slave.setCloudId(name);
+        return slave;
     }
 
     @Override
@@ -434,7 +418,7 @@ public class DockerCloud extends Cloud {
     @CheckForNull
     public DockerTemplate getTemplate(String template) {
         for (DockerTemplate t : templates) {
-            if (t.getDockerTemplateBase().getImage().equals(template)) {
+            if (t.getImage().equals(template)) {
                 return t;
             }
         }
@@ -610,8 +594,12 @@ public class DockerCloud extends Cloud {
         for (DockerTemplate template : getTemplates()) {
             template.readResolve();
         }
-        // This change will bite a lot of people otherwise.
-        serverUrl = sanitizeUrl(serverUrl);
+
+        if (dockerHost == null) {
+            serverUrl = sanitizeUrl(serverUrl);
+            // migration to docker-commons
+            dockerHost = new DockerServerEndpoint(serverUrl, credentialsId);
+        }
 
         return this;
     }
@@ -635,12 +623,9 @@ public class DockerCloud extends Cloud {
         if (connectTimeout != that.connectTimeout) return false;
         if (readTimeout != that.readTimeout) return false;
         if (templates != null ? !templates.equals(that.templates) : that.templates != null) return false;
-        if (serverUrl != null ? !serverUrl.equals(that.serverUrl) : that.serverUrl != null) return false;
+        if (!dockerHost.equals(that.dockerHost))return false;
         if (version != null ? !version.equals(that.version) : that.version != null) return false;
-        if (credentialsId != null ? !credentialsId.equals(that.credentialsId) : that.credentialsId != null)
-            return false;
-        return !(connection != null ? !connection.equals(that.connection) : that.connection != null);
-
+        return true;
     }
 
     /* package */ boolean isSwarm() {
@@ -671,6 +656,17 @@ public class DockerCloud extends Cloud {
         this.exposeDockerHost = exposeDockerHost;
     }
 
+    public static List<DockerCloud> instances() {
+        List<DockerCloud> instances = new ArrayList<>();
+        for (Cloud cloud : Jenkins.getInstance().clouds) {
+            if (cloud instanceof DockerCloud) {
+                instances.add((DockerCloud) cloud);
+            }
+
+        }
+        return instances;
+    }
+
 
     @Extension
     public static class DescriptorImpl extends Descriptor<Cloud> {
@@ -680,7 +676,7 @@ public class DockerCloud extends Cloud {
         }
 
         public FormValidation doTestConnection(
-                @QueryParameter String serverUrl,
+                @QueryParameter String uri,
                 @QueryParameter String credentialsId,
                 @QueryParameter String version,
                 @QueryParameter Integer readTimeout,
@@ -688,7 +684,7 @@ public class DockerCloud extends Cloud {
         ) throws IOException, ServletException, DockerException {
             try {
                 final DockerClientConfig clientConfig = ClientConfigBuilderForPlugin.dockerClientConfig()
-                        .forServer(serverUrl, version)
+                        .forServer(uri, version)
                         .withCredentials(credentialsId)
                         .build();
 
@@ -710,23 +706,64 @@ public class DockerCloud extends Cloud {
             }
         }
 
-        public ListBoxModel doFillCredentialsIdItems(@AncestorInPath ItemGroup context) {
-
+        public ListBoxModel doFillCredentialsIdItems(@AncestorInPath ItemGroup context, @QueryParameter String value) {
             AccessControlled ac = (context instanceof AccessControlled ? (AccessControlled) context : Jenkins.getInstance());
             if (!ac.hasPermission(Jenkins.ADMINISTER)) {
-                return new ListBoxModel();
+                return new StandardListBoxModel().includeCurrentValue(value);
             }
 
-            List<StandardCertificateCredentials> credentials = CredentialsProvider.lookupCredentials(StandardCertificateCredentials.class, context, ACL.SYSTEM,Collections.<DomainRequirement>emptyList());
-            List<DockerDirectoryCredentials> c2 = CredentialsProvider.lookupCredentials(DockerDirectoryCredentials.class, context, ACL.SYSTEM,Collections.<DomainRequirement>emptyList());
-
-            return new StandardListBoxModel()
-                    .withEmptySelection()
-                    .withMatching(CredentialsMatchers.always(), credentials)
-                    .withMatching(CredentialsMatchers.always(), c2);
+            return new StandardListBoxModel().includeAs(
+                    ACL.SYSTEM, context, DockerServerCredentials.class,
+                    Collections.<DomainRequirement>emptyList());
         }
-
-
     }
 
+
+    // unfortunately there's no common interface for Registry related Docker-java commands
+
+    @Restricted(NoExternalUse.class)
+    public static void setRegistryAuthentication(PullImageCmd cmd, DockerRegistryEndpoint registry, ItemGroup context) throws IOException {
+        if (registry != null && registry.getCredentialsId() != null) {
+            AuthConfig auth = getAuthConfig(registry, context);
+            cmd.withAuthConfig(auth);
+        }
+    }
+
+    @Restricted(NoExternalUse.class)
+    public static void setRegistryAuthentication(PushImageCmd cmd, DockerRegistryEndpoint registry, ItemGroup context) throws IOException {
+        if (registry != null && registry.getCredentialsId() != null) {
+            AuthConfig auth = getAuthConfig(registry, context);
+            cmd.withAuthConfig(auth);
+        }
+    }
+
+    @Restricted(NoExternalUse.class)
+    public static AuthConfig getAuthConfig(DockerRegistryEndpoint registry, ItemGroup context) throws IOException {
+        AuthConfig auth = new AuthConfig();
+
+        // we can't use DockerRegistryEndpoint#getToken as this one do check domainRequirement based on registry URL
+        // but in some context (typically, passing registry auth for `docker build`) we just can't guess this one.
+
+        Credentials c = firstOrNull(CredentialsProvider.lookupCredentials(
+                IdCredentials.class, context, ACL.SYSTEM, Collections.EMPTY_LIST),
+                withId(registry.getCredentialsId()));
+
+        if (c == null) {
+            throw new IllegalArgumentException("Invalid Credential ID " + registry.getCredentialsId());
+        }
+
+        final DockerRegistryToken t = AuthenticationTokens.convert(DockerRegistryToken.class, c);
+        final String token = t.getToken();
+        // What docker-commons claim to be a "token" is actually configuration storage
+        // see https://github.com/docker/docker-ce/blob/v17.09.0-ce/components/cli/cli/config/configfile/file.go#L214
+        // i.e base64 encoded username : password
+        final String decode = new String(Base64.decodeBase64(token));
+        int i = decode.indexOf(':');
+        if (i > 0) {
+            String username = decode.substring(0, i);
+            auth.withUsername(username);
+        }
+        auth.withPassword(decode.substring(i+1));
+        return auth;
+    }
 }

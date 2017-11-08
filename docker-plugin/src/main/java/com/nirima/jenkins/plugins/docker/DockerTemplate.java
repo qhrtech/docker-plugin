@@ -2,12 +2,9 @@ package com.nirima.jenkins.plugins.docker;
 
 import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.model.PortBinding;
-import com.github.dockerjava.core.NameParser;
 import com.google.common.base.Objects;
 import com.google.common.base.Strings;
-import com.nirima.jenkins.plugins.docker.launcher.DockerComputerJNLPLauncher;
 import com.nirima.jenkins.plugins.docker.launcher.DockerComputerLauncher;
-import com.nirima.jenkins.plugins.docker.launcher.DockerComputerSSHLauncher;
 import com.nirima.jenkins.plugins.docker.strategy.DockerOnceRetentionStrategy;
 import hudson.Extension;
 import hudson.Util;
@@ -16,17 +13,14 @@ import hudson.model.Descriptor;
 import hudson.model.Label;
 import hudson.model.Node;
 import hudson.model.labels.LabelAtom;
-import hudson.slaves.ComputerLauncher;
 import hudson.slaves.NodeProperty;
 import hudson.slaves.NodePropertyDescriptor;
 import hudson.slaves.RetentionStrategy;
 import hudson.util.DescribableList;
 import hudson.util.FormValidation;
-import io.jenkins.docker.AttachedDockerSlaveProvisioner;
-import io.jenkins.docker.DockerSlaveProvisioner;
-import io.jenkins.docker.JNLPDockerSlaveProvisioner;
-import io.jenkins.docker.SSHDockerSlaveProvisioner;
+import io.jenkins.docker.connector.DockerComputerConnector;
 import jenkins.model.Jenkins;
+import org.jenkinsci.plugins.docker.commons.credentials.DockerRegistryEndpoint;
 import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.DataBoundConstructor;
@@ -34,22 +28,27 @@ import org.kohsuke.stapler.DataBoundSetter;
 import org.kohsuke.stapler.QueryParameter;
 
 import javax.annotation.CheckForNull;
+import javax.annotation.Nonnull;
 import java.io.IOException;
 import java.util.Collections;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Set;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
 
-public class DockerTemplate extends DockerTemplateBackwardCompatibility implements Describable<DockerTemplate> {
+public class DockerTemplate implements Describable<DockerTemplate> {
     private static final Logger LOGGER = Logger.getLogger(DockerTemplate.class.getName());
 
     private int configVersion = 2;
 
     private final String labelString;
 
-    private DockerComputerLauncher launcher;
+    private DockerComputerConnector connector;
+
+    @Deprecated
+    private transient DockerComputerLauncher launcher;
 
     public final String remoteFsMapping;
 
@@ -85,7 +84,7 @@ public class DockerTemplate extends DockerTemplateBackwardCompatibility implemen
     }
 
     @DataBoundConstructor
-    public DockerTemplate(DockerTemplateBase dockerTemplateBase,
+    public DockerTemplate(@Nonnull DockerTemplateBase dockerTemplateBase,
                           String labelString,
                           String remoteFs,
                           String remoteFsMapping,
@@ -108,47 +107,6 @@ public class DockerTemplate extends DockerTemplateBackwardCompatibility implemen
         this.nodeProperties.clear();
         if (nodeProperties != null) {
             this.nodeProperties.addAll(nodeProperties);
-        }
-    }
-
-    /**
-     * Contains all available arguments
-     * @throws IOException 
-     */
-    @Restricted(value = NoExternalUse.class)
-    public DockerTemplate(DockerTemplateBase dockerTemplateBase,
-                          String labelString,
-                          String remoteFs,
-                          String remoteFsMapping,
-                          String instanceCapStr,
-                          List<? extends NodeProperty<?>> nodeProperties,
-                          Node.Mode mode,
-                          int numExecutors,
-                          DockerComputerLauncher launcher,
-                          RetentionStrategy retentionStrategy,
-                          boolean removeVolumes,
-                          DockerImagePullStrategy pullStrategy) {
-        this(dockerTemplateBase,
-                labelString,
-                remoteFs,
-                remoteFsMapping,
-                instanceCapStr,
-                nodeProperties);
-        setMode(mode);
-        setNumExecutors(numExecutors);
-        setLauncher(launcher);
-        setRetentionStrategy(retentionStrategy);
-        setRemoveVolumes(removeVolumes);
-        setPullStrategy(pullStrategy);
-    }
-
-    public DockerSlaveProvisioner getProvisioner(DockerCloud cloud) {
-        if (launcher instanceof DockerComputerJNLPLauncher) {
-            return new JNLPDockerSlaveProvisioner(cloud, this, cloud.getClient(), (DockerComputerJNLPLauncher) launcher);
-        } else if (launcher instanceof DockerComputerSSHLauncher) {
-            return new SSHDockerSlaveProvisioner(cloud, this, cloud.getClient(), (DockerComputerSSHLauncher) launcher);
-        } else {
-            return new AttachedDockerSlaveProvisioner(cloud, this, cloud.getClient());
         }
     }
 
@@ -230,6 +188,10 @@ public class DockerTemplate extends DockerTemplateBackwardCompatibility implemen
         return dockerTemplateBase.getExtraHostsString();
     }
 
+    public DockerRegistryEndpoint getRegistry() {
+        return dockerTemplateBase.getRegistry();
+    }
+
     public CreateContainerCmd fillContainerConfig(CreateContainerCmd containerConfig) {
         return dockerTemplateBase.fillContainerConfig(containerConfig);
     }
@@ -237,9 +199,7 @@ public class DockerTemplate extends DockerTemplateBackwardCompatibility implemen
     // --
 
     public String getFullImageId() {
-        NameParser.ReposTag repostag = NameParser.parseRepositoryTag(dockerTemplateBase.getImage());
-        // if image was specified without tag, then treat as latest
-        return repostag.repos + ":" + (repostag.tag.isEmpty() ? "latest" : repostag.tag);
+        return dockerTemplateBase.getFullImageId();
     }
 
 
@@ -312,12 +272,12 @@ public class DockerTemplate extends DockerTemplateBackwardCompatibility implemen
 
 
     @DataBoundSetter
-    public void setLauncher(DockerComputerLauncher launcher) {
-        this.launcher = launcher;
+    public void setConnector(DockerComputerConnector connector) {
+        this.connector = connector;
     }
 
-    public DockerComputerLauncher getLauncher() {
-        return launcher;
+    public DockerComputerConnector getConnector() {
+        return connector;
     }
 
     public String getRemoteFs() {
@@ -386,11 +346,6 @@ public class DockerTemplate extends DockerTemplateBackwardCompatibility implemen
      */
     public Object readResolve() {
         try {
-            if (configVersion < 1) {
-                convert1();
-                configVersion = 1;
-            }
-
             // https://github.com/jenkinsci/docker-plugin/issues/270
             if (configVersion < 2) {
                 if (retentionStrategy instanceof DockerOnceRetentionStrategy) {
@@ -403,17 +358,32 @@ public class DockerTemplate extends DockerTemplateBackwardCompatibility implemen
             } else {
                configDefaults();
             }
+
+            try {
+                labelSet = Label.parse(labelString); // fails sometimes under debugger
+            } catch (Throwable t) {
+                LOGGER.log(Level.SEVERE, "Can't parse labels: ", t);
+            }
+
+            if (connector == null && launcher != null) {
+                connector = launcher.convertToConnector();
+            }
         } catch (Throwable t) {
             LOGGER.log(Level.SEVERE, "Can't convert old values to new (double conversion?): ", t);
         }
-
-        try {
-            labelSet = Label.parse(labelString); // fails sometimes under debugger
-        } catch (Throwable t) {
-            LOGGER.log(Level.SEVERE, "Can't parse labels: ", t);
-        }
-
         return this;
+    }
+
+    @Restricted(NoExternalUse.class)
+    public DockerTemplate cloneWithLabel(String label) {
+        final DockerTemplate template = new DockerTemplate(dockerTemplateBase, label, remoteFs, remoteFsMapping, "1", nodeProperties);
+        template.setConnector(connector);
+        template.setMode(Node.Mode.EXCLUSIVE);
+        template.setNumExecutors(1);
+        template.setPullStrategy(pullStrategy);
+        template.setRemoveVolumes(removeVolumes);
+        template.setRetentionStrategy(retentionStrategy);
+        return template;
     }
 
     @Override
@@ -421,7 +391,7 @@ public class DockerTemplate extends DockerTemplateBackwardCompatibility implemen
         return "DockerTemplate{" +
                 "configVersion=" + configVersion +
                 ", labelString='" + labelString + '\'' +
-                ", launcher=" + launcher +
+                ", connector=" + connector +
                 ", remoteFsMapping='" + remoteFsMapping + '\'' +
                 ", remoteFs='" + remoteFs + '\'' +
                 ", instanceCap=" + instanceCap +
@@ -455,6 +425,24 @@ public class DockerTemplate extends DockerTemplateBackwardCompatibility implemen
                 return FormValidation.error("Must be > 0");
             }
             return FormValidation.ok();
+        }
+
+        /**
+         * Get a list of all {@link NodePropertyDescriptor}s we can use to define DockerSlave NodeProperties.
+         */
+        public List<NodePropertyDescriptor> getNodePropertyDescriptors() {
+            DockerSlave.DescriptorImpl descriptor = (DockerSlave.DescriptorImpl) Jenkins.getInstance().getDescriptorOrDie(DockerSlave.class);
+            final List<NodePropertyDescriptor> descriptors = descriptor.nodePropertyDescriptors(null);
+
+            final Iterator<NodePropertyDescriptor> iterator = descriptors.iterator();
+            while (iterator.hasNext()) {
+                final NodePropertyDescriptor de = iterator.next();
+                // see https://issues.jenkins-ci.org/browse/JENKINS-47697
+                if ("org.jenkinsci.plugins.matrixauth.AuthorizationMatrixNodeProperty".equals(de.getKlass().toJavaClass().getName())) {
+                    iterator.remove();
+                }
+            }
+            return descriptors;
         }
 
         @Override

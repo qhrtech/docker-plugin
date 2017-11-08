@@ -1,9 +1,15 @@
 package com.nirima.jenkins.plugins.docker.builder;
 
 import com.github.dockerjava.api.exception.DockerException;
+import com.nirima.jenkins.plugins.docker.DockerCloud;
 import com.nirima.jenkins.plugins.docker.action.DockerLaunchAction;
 import hudson.Launcher;
-import hudson.model.*;
+import hudson.model.Describable;
+import hudson.model.Descriptor;
+import hudson.model.Run;
+import hudson.model.TaskListener;
+import hudson.slaves.Cloud;
+import hudson.util.ListBoxModel;
 import jenkins.model.Jenkins;
 
 import java.io.IOException;
@@ -18,7 +24,7 @@ import java.util.List;
 public abstract class DockerBuilderControlOption implements Describable<DockerBuilderControlOption>, Serializable {
 
     public abstract void execute(Run<?, ?> build, Launcher launcher, TaskListener listener)
-            throws DockerException;
+            throws DockerException, IOException;
 
     /**
      * @return first DockerLaunchAction attached to build
@@ -38,5 +44,18 @@ public abstract class DockerBuilderControlOption implements Describable<DockerBu
     @SuppressWarnings({"unchecked", "rawtypes"})
     public Descriptor<DockerBuilderControlOption> getDescriptor() {
         return Jenkins.getInstance().getDescriptorOrDie(getClass());
+    }
+
+    public static abstract class DockerBuilderControlOptionDescriptor extends Descriptor<DockerBuilderControlOption> {
+
+        public ListBoxModel doFillCloudNameItems() {
+            ListBoxModel model = new ListBoxModel();
+            model.add("Cloud this build is running on", "");
+            for (Cloud cloud : DockerCloud.instances()) {
+                model.add(cloud.name);
+            }
+            return model;
+        }
+
     }
 }

@@ -1,8 +1,52 @@
 # Changelog
 
+## 1.0.4
+
+* fix support for binded ports
+* fix SSH command Prefix / Suffix
+* fix JNLP agent provisionning
+* disable Matrix-autorisation node property (JENKINS-47697)
+
+## 1.0.3
+
+* fix configuration lost when upgrading from 0.x to 1.0.2
+
+## 1.0.2
+
+* fix credential management to access a private docker registry
+* log in debug diagnostic information on created container
+* re-implemented UI for SSH connector with explicit SSH key strategies
+* use configured user for JNLP launcher
+* wait for ssh service to be up before trying to connect
+* refactored launchers for extensibility and pipeline compatibility (reconnect slave after restart) 
+
+## 1.0.1
+
+* upgrade docker-java API client to 3.0.14
+* fix credential management to access a private docker registry
+* fix JNLP launcher for master with required authentication
+* option to disable SSH key injection (backward compatibility)
+
+## 1.0.0
+
+* fix missuse of obsolete serverUrl
+* removed some obsolete code
+* fix serialization issue with DockerBuildPublisher on a remote agent
+* implemented credentials migrattion to docker-commons
+* minor UI fixes
+* fix registry authentication (username/password)
+
+## 0.18.0
+* Token Macro is actually a required plugin dependency
+* Template sections in cloud configuration is now collapsible
+* Fix a regression in SSH launcher
+* Fix swarm standalone pull status detection
+* Use non infinite default timeout
+
 ## 0.17.0
 
-* Move to docker-java 3.0.13
+* Move to [docker-java](http://wiki.jenkins-ci.org/display/JENKINS/Docker+Java+API+Plugin) 3.0.13
+* Adopted [docker-commons](https://wiki.jenkins.io/display/JENKINS/Docker+Commons+Plugin) for docker API and registry credentials
 * Refactored computer launcher for more flexibility
 * SSH launcher now inject dedicated ssh key pair
 * introduce experimental interactive launcher

@@ -4,8 +4,12 @@ import com.google.common.base.Objects;
 import hudson.model.Executor;
 import hudson.model.Queue;
 import hudson.model.Run;
+import hudson.model.Slave;
 import hudson.slaves.AbstractCloudComputer;
+import jenkins.model.Jenkins;
 
+import java.io.IOException;
+import java.util.concurrent.Callable;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 
@@ -17,17 +21,8 @@ import java.util.logging.Logger;
 public class DockerComputer extends AbstractCloudComputer<DockerSlave> {
     private static final Logger LOGGER = Logger.getLogger(DockerComputer.class.getName());
 
-    /**
-     * remember associated container id
-     */
-    private String containerId;
-
-    private String cloudId;
-
     public DockerComputer(DockerSlave dockerSlave) {
         super(dockerSlave);
-        setContainerId(dockerSlave.getContainerId());
-        setCloudId(dockerSlave.getCloudId());
     }
 
     public DockerCloud getCloud() {
@@ -69,21 +64,11 @@ public class DockerComputer extends AbstractCloudComputer<DockerSlave> {
     }
 
     public String getContainerId() {
-        return containerId;
-    }
-
-    public void setContainerId(String containerId) {
-        this.containerId = containerId;
-        getNode().setContainerId(containerId); // set for clean-ups
+        return getNode().getContainerId();
     }
 
     public String getCloudId() {
-        return cloudId;
-    }
-
-    public void setCloudId(String cloudId) {
-        this.cloudId = cloudId;
-        getNode().setCloudId(cloudId);
+        return getNode().getCloudId();
     }
 
     @Override

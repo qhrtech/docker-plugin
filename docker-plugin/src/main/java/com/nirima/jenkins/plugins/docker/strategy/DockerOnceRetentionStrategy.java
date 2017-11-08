@@ -1,18 +1,24 @@
 package com.nirima.jenkins.plugins.docker.strategy;
 
 import hudson.Extension;
-import hudson.model.*;
-import hudson.slaves.*;
-import hudson.util.TimeUnit2;
-import jenkins.model.Jenkins;
+import hudson.model.Computer;
+import hudson.model.Descriptor;
+import hudson.model.Executor;
+import hudson.model.ExecutorListener;
+import hudson.model.Queue;
+import hudson.slaves.AbstractCloudComputer;
+import hudson.slaves.AbstractCloudSlave;
+import hudson.slaves.CloudRetentionStrategy;
+import hudson.slaves.EphemeralNode;
+import hudson.slaves.RetentionStrategy;
 import org.jenkinsci.plugins.durabletask.executors.ContinuableExecutable;
-import org.kohsuke.accmod.Restricted;
-import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.DataBoundConstructor;
 
 import java.io.IOException;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+
+import static hudson.util.TimeUnit2.MINUTES;
 
 /**
  * Mix of {@link org.jenkinsci.plugins.durabletask.executors.OnceRetentionStrategy} (1.3) and {@link CloudRetentionStrategy}
@@ -25,7 +31,7 @@ public class DockerOnceRetentionStrategy extends CloudRetentionStrategy implemen
 
     private static final Logger LOGGER = Logger.getLogger(DockerOnceRetentionStrategy.class.getName());
 
-    private int idleMinutes = 10;
+    private int timeout = 10;
     private transient boolean terminating;
 
     /**
@@ -36,11 +42,11 @@ public class DockerOnceRetentionStrategy extends CloudRetentionStrategy implemen
     @DataBoundConstructor
     public DockerOnceRetentionStrategy(int idleMinutes) {
         super(idleMinutes);
-        this.idleMinutes = idleMinutes;
+        this.timeout = idleMinutes;
     }
 
     public int getIdleMinutes() {
-        return idleMinutes;
+        return timeout;
     }
 
     @Override
@@ -49,7 +55,7 @@ public class DockerOnceRetentionStrategy extends CloudRetentionStrategy implemen
         // terminate. If it's not already trying to terminate then lets terminate manually.
         if (c.isIdle() && !disabled) {
             final long idleMilliseconds = System.currentTimeMillis() - c.getIdleStartMilliseconds();
-            if (idleMilliseconds > TimeUnit2.MINUTES.toMillis(idleMinutes)) {
+            if (idleMilliseconds > MINUTES.toMillis(timeout)) {
                 LOGGER.log(Level.FINE, "Disconnecting {0}", c.getName());
                 done(c);
             }
@@ -127,7 +133,7 @@ public class DockerOnceRetentionStrategy extends CloudRetentionStrategy implemen
     public static final class DescriptorImpl extends Descriptor<RetentionStrategy<?>> {
         @Override
         public String getDisplayName() {
-            return "Docker Once Retention Strategy";
+            return "Use container only once";
         }
     }
 

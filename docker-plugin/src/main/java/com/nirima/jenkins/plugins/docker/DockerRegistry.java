@@ -19,12 +19,13 @@ import jenkins.model.Jenkins;
 import org.kohsuke.stapler.AncestorInPath;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
+import org.kohsuke.stapler.QueryParameter;
 
 import java.util.Collections;
 import java.util.List;
 
 
-@Extension
+@Deprecated
 public class DockerRegistry  implements Describable<DockerRegistry> {
     public String registry;
     public String credentialsId;
@@ -54,26 +55,19 @@ public class DockerRegistry  implements Describable<DockerRegistry> {
     }
 
 
+    private Object readResolve() {
+        // TODO migrate to docker-commons' DockerRegistryEndpoint
+        // inspect all DockerTemplates
+        return this;
+    }
 
-    @Extension
+
+    @Deprecated
     public static final class DescriptorImpl extends Descriptor<DockerRegistry> {
 
         @Override
         public String getDisplayName() {
             return "Docker Registry";
-        }
-
-        public ListBoxModel doFillCredentialsIdItems(@AncestorInPath ItemGroup context) {
-            AccessControlled ac = (context instanceof AccessControlled ? (AccessControlled) context : Jenkins.getInstance());
-            if (!ac.hasPermission(Jenkins.ADMINISTER)) {
-                return new ListBoxModel();
-            }
-
-
-            List<StandardUsernamePasswordCredentials> credentials = CredentialsProvider.lookupCredentials(StandardUsernamePasswordCredentials.class, context, ACL.SYSTEM, Collections.<DomainRequirement>emptyList());
-
-            return new StandardListBoxModel().withEmptySelection()
-                    .withMatching(CredentialsMatchers.always(), credentials);
         }
     }
 

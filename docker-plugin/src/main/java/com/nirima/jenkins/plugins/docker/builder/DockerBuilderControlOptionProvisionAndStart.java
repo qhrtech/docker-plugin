@@ -13,7 +13,6 @@ import org.kohsuke.stapler.DataBoundConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.io.IOException;
 import java.io.PrintStream;
 
 /**
@@ -44,7 +43,7 @@ public class DockerBuilderControlOptionProvisionAndStart extends DockerBuilderCo
         final DockerCloud cloud = getCloud(build, launcher);
         DockerTemplate template = cloud.getTemplate(templateId);
         DockerClient client = cloud.getClient();
-        String containerId = DockerCloud.runContainer(template.getDockerTemplateBase(), client, null);
+        String containerId = DockerCloud.runContainer(template.getDockerTemplateBase(), client);
 
         LOG.info("Starting container {}, cloud {}", containerId, cloud.getDisplayName());
         llog.println("Starting container " + containerId + ", cloud " + cloud.getDisplayName());

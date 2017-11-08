@@ -2,30 +2,27 @@ package com.nirima.jenkins.plugins.docker.builder;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.command.PullImageCmd;
+import com.github.dockerjava.api.exception.DockerClientException;
 import com.github.dockerjava.api.exception.DockerException;
-import com.github.dockerjava.api.model.AuthConfig;
+import com.github.dockerjava.api.exception.NotFoundException;
 import com.github.dockerjava.api.model.PullResponseItem;
 import com.github.dockerjava.core.command.PullImageResultCallback;
+import com.google.common.base.Strings;
 import com.nirima.jenkins.plugins.docker.DockerCloud;
 import com.nirima.jenkins.plugins.docker.DockerSimpleTemplate;
 import com.nirima.jenkins.plugins.docker.DockerTemplateBase;
-import com.nirima.jenkins.plugins.docker.utils.JenkinsUtils;
-
 import hudson.Extension;
 import hudson.Launcher;
 import hudson.model.AbstractBuild;
-import hudson.model.BuildListener;
 import hudson.model.Run;
 import hudson.model.TaskListener;
-import org.apache.commons.io.IOUtils;
+import org.jenkinsci.plugins.docker.commons.credentials.DockerRegistryEndpoint;
 import org.jenkinsci.plugins.tokenmacro.TokenMacro;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import com.google.common.base.Strings;
 
 import java.io.IOException;
-import java.io.InputStream;
 import java.io.PrintStream;
 
 /**
@@ -37,6 +34,8 @@ public class DockerBuilderControlOptionRun extends DockerBuilderControlCloudOpti
     private static final Logger LOG = LoggerFactory.getLogger(DockerBuilderControlOptionRun.class);
 
     public final String image;
+    private String pullCredentialsId;
+    private transient DockerRegistryEndpoint registry;
     public final String dnsString;
     public final String network;
     public final String dockerCommand;
@@ -58,6 +57,7 @@ public class DockerBuilderControlOptionRun extends DockerBuilderControlCloudOpti
     public DockerBuilderControlOptionRun(
             String cloudName,
             String image,
+            String pullCredentialsId,
             String lxcConfString,
             String dnsString,
             String network,
@@ -76,7 +76,7 @@ public class DockerBuilderControlOptionRun extends DockerBuilderControlCloudOpti
             String macAddress) {
         super(cloudName);
         this.image = image;
-
+        this.pullCredentialsId = pullCredentialsId;
         this.lxcConfString = lxcConfString;
         this.dnsString = dnsString;
         this.network = network;
@@ -95,9 +95,16 @@ public class DockerBuilderControlOptionRun extends DockerBuilderControlCloudOpti
         this.macAddress = macAddress;
     }
 
+    public DockerRegistryEndpoint getRegistry() {
+        if (registry == null) {
+            registry = new DockerRegistryEndpoint(null, pullCredentialsId);
+        }
+        return registry;
+    }
+
     @Override
     public void execute(Run<?, ?> build, Launcher launcher, TaskListener listener)
-            throws DockerException {
+            throws DockerException, IOException {
         final PrintStream llog = listener.getLogger();
 
         DockerClient client = getCloud(build,launcher).getClient();
@@ -121,20 +128,27 @@ public class DockerBuilderControlOptionRun extends DockerBuilderControlCloudOpti
         };
 
         PullImageCmd cmd = client.pullImageCmd(xImage);
-        AuthConfig authConfig = JenkinsUtils.getAuthConfigFor(image);
-        if( authConfig != null ) {
-            cmd.withAuthConfig(authConfig);
+        DockerCloud.setRegistryAuthentication(cmd, getRegistry(), build.getParent().getParent());
+        try {
+            cmd.exec(resultCallback).awaitCompletion();
+        } catch (InterruptedException e) {
+            throw new DockerClientException("Interrupted while pulling image", e);
         }
-        cmd.exec(resultCallback).awaitSuccess();
+        try {
+            client.inspectImageCmd(xImage).exec();
+        } catch (NotFoundException e) {
+            throw new DockerClientException("Failed to pull image: " + image, e);
+        }
 
-        DockerTemplateBase template = new DockerSimpleTemplate(xImage,
+
+        DockerTemplateBase template = new DockerSimpleTemplate(xImage, pullCredentialsId,
                 dnsString, network, xCommand,
                 volumesString, volumesFrom, environmentsString, lxcConfString, xHostname,
                 memoryLimit, memorySwap, cpuShares, bindPorts, bindAllPorts, privileged, tty, macAddress);
 
         LOG.info("Starting container for image {}", xImage);
         llog.println("Starting container for image " + xImage);
-        String containerId = DockerCloud.runContainer(template, client, null);
+        String containerId = DockerCloud.runContainer(template, client);
 
         LOG.info("Started container {}", containerId);
         llog.println("Started container " + containerId);
