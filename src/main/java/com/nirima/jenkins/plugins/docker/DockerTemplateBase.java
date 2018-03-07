@@ -19,6 +19,7 @@ import com.google.common.collect.Iterables;
 import com.nirima.jenkins.plugins.docker.utils.JenkinsUtils;
 import com.trilead.ssh2.Connection;
 import hudson.Extension;
+import hudson.Util;
 import hudson.model.Describable;
 import hudson.model.Descriptor;
 import hudson.model.Item;
@@ -46,15 +47,33 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.logging.Logger;
 
+import static org.apache.commons.lang.StringUtils.isEmpty;
 import static org.apache.commons.lang.StringUtils.trimToNull;
 
 /**
  * Base for docker templates - does not include Jenkins items like labels.
  */
 public class DockerTemplateBase implements Describable<DockerTemplateBase>, Serializable {
-    private static final Logger LOGGER = Logger.getLogger(DockerTemplateBase.class.getName());
+
+    /**
+     * Name of the Docker "label" that we'll put into every container we start,
+     * setting its value to our {@link #getJenkinsInstanceIdForContainerLabel()}, so that we
+     * can recognize our own containers later.
+     */
+    static String CONTAINER_LABEL_JENKINS_INSTANCE_ID = "JenkinsId";
+    /**
+     * Name of the Docker "label" that we'll put into every container we start,
+     * setting its value to our {@link Jenkins#getRootUrl()}, so that we
+     * can recognize our own containers later.
+     */
+    static String CONTAINER_LABEL_JENKINS_URL = "JenkinsServerUrl";
+    /**
+     * Name of the Docker "label" that we'll put into every container we start,
+     * setting its value to our {@link #getImage()}, so that we
+     * can recognize our own containers later.
+     */
+    static String CONTAINER_LABEL_IMAGE = "JenkinsContainerImage";
 
     private final String image;
 
@@ -370,15 +389,16 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
 
     @DataBoundSetter
     public void setExtraHostsString(String extraHostsString) {
-        setExtraHosts(splitAndFilterEmptyList(extraHostsString, "\n"));
+        setExtraHosts(isEmpty(extraHostsString) ?
+                Collections.EMPTY_LIST :
+                splitAndFilterEmptyList(extraHostsString, "\n"));
     }
 
     public String getExtraHostsString() {
         if (extraHosts == null) {
             return "";
-        } else {
-            return Joiner.on("\n").join(extraHosts);
         }
+        return Joiner.on("\n").join(extraHosts);
     }
 
     // -- UI binding End
@@ -390,7 +410,7 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
         }
         return registry;
     }
-    
+
     /**
      * @deprecated use {@link #getVolumesFrom2()}
      */
@@ -451,7 +471,6 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
                 });
     }
 
-
     public CreateContainerCmd fillContainerConfig(CreateContainerCmd containerConfig) {
         if (hostname != null && !hostname.isEmpty()) {
             containerConfig.withHostName(hostname);
@@ -469,8 +488,10 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
         containerConfig.withPrivileged(privileged);
 
         Map<String,String> map = new HashMap<>();
-        map.put("JenkinsId", JenkinsUtils.getInstanceId());
-
+        map.put(CONTAINER_LABEL_JENKINS_INSTANCE_ID, getJenkinsInstanceIdForContainerLabel());
+        map.put(CONTAINER_LABEL_JENKINS_URL, getJenkinsUrlForContainerLabel());
+        map.put(CONTAINER_LABEL_IMAGE, getImage());
+        
         HostConfig hostConfig = containerConfig.getHostConfig();
         hostConfig.withShmSize( 512L * 1024 * 1024 );
 
@@ -484,14 +505,14 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
             Long memoryInByte = (long) memoryLimit * 1024 * 1024;
             containerConfig.withMemory(memoryInByte);
         }
-        
+
         if (memorySwap != null) {
-      	  if(memorySwap > 0) {
-      		  Long memorySwapInByte = (long) memorySwap * 1024 * 1024;
-              containerConfig.withMemorySwap(memorySwapInByte);
-      	  } else {
-      		  containerConfig.withMemorySwap(memorySwap.longValue());
-      	  }
+            if (memorySwap > 0) {
+                Long memorySwapInByte = (long) memorySwap * 1024 * 1024;
+                containerConfig.withMemorySwap(memorySwapInByte);
+            } else {
+                containerConfig.withMemorySwap(memorySwap.longValue());
+            }
         }
 
         if (dnsHosts != null && dnsHosts.length > 0) {
@@ -554,9 +575,29 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
         return containerConfig;
     }
 
+
+    /**
+     * Calculates the value we use for the Docker label called
+     * {@link #CONTAINER_LABEL_JENKINS_URL} that we put into every
+     * container we make, so that we can recognize our own containers later.
+     */
+    static String getJenkinsUrlForContainerLabel() {
+        final String rootUrl = Jenkins.getInstance().getRootUrl();
+        return Util.fixNull(rootUrl);
+    }
+
+    /**
+     * Calculates the value we use for the Docker label called
+     * {@link #CONTAINER_LABEL_JENKINS_INSTANCE_ID} that we put into every
+     * container we make, so that we can recognize our own containers later.
+     */
+    static String getJenkinsInstanceIdForContainerLabel() {
+        return JenkinsUtils.getInstanceId();
+    }
+
     @Override
     public Descriptor<DockerTemplateBase> getDescriptor() {
-        return (DescriptorImpl) Jenkins.getInstance().getDescriptor(DockerTemplateBase.class);
+        return Jenkins.getInstance().getDescriptor(DockerTemplateBase.class);
     }
 
     public String getFullImageId() {

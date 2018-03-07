@@ -27,7 +27,6 @@ import hudson.slaves.NodeProperty;
 import hudson.slaves.NodePropertyDescriptor;
 import hudson.slaves.RetentionStrategy;
 import hudson.util.DescribableList;
-import hudson.util.FormValidation;
 import io.jenkins.docker.DockerTransientNode;
 import io.jenkins.docker.client.DockerAPI;
 import io.jenkins.docker.connector.DockerComputerConnector;
@@ -37,7 +36,6 @@ import org.kohsuke.accmod.Restricted;
 import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.kohsuke.stapler.DataBoundConstructor;
 import org.kohsuke.stapler.DataBoundSetter;
-import org.kohsuke.stapler.QueryParameter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -104,7 +102,7 @@ public class DockerTemplate implements Describable<DockerTemplate> {
         this.labelString = Util.fixNull(labelString);
         this.remoteFs = Strings.isNullOrEmpty(remoteFs) ? "/home/jenkins" : remoteFs;
 
-        if (instanceCapStr.equals("")) {
+        if (Strings.isNullOrEmpty(instanceCapStr)) {
             this.instanceCap = Integer.MAX_VALUE;
         } else {
             this.instanceCap = Integer.parseInt(instanceCapStr);
@@ -415,32 +413,38 @@ public class DockerTemplate implements Describable<DockerTemplate> {
     @Restricted(NoExternalUse.class)
     public DockerTransientNode provisionNode(DockerAPI api, TaskListener listener) throws IOException, Descriptor.FormException, InterruptedException {
 
-        final DockerClient client = api.getClient();
         final DockerComputerConnector connector = getConnector();
         pullImage(api, listener);
 
         LOGGER.info("Trying to run container for {}", getImage());
+
+        final DockerClient client = api.getClient();
+
         CreateContainerCmd cmd = client.createContainerCmd(getImage());
         fillContainerConfig(cmd);
 
+        // Unique ID we use both as Node identifier and container Name
+        // See how DockerComputerJNLPConnector.beforeContainerCreated() is building the JNLP jar command
+        final String uid = Long.toHexString(System.nanoTime());
+        cmd.withName(uid);
+
         connector.beforeContainerCreated(api, remoteFs, cmd);
 
+        LOGGER.info("Trying to run container {} from image: {}", uid, getImage());
         String containerId = cmd.exec().getId();
 
         try {
             connector.beforeContainerStarted(api, remoteFs, containerId);
-
             client.startContainerCmd(containerId).exec();
-
             connector.afterContainerStarted(api, remoteFs, containerId);
         } catch (DockerException e) {
             // if something went wrong, cleanup aborted container
             client.removeContainerCmd(containerId).withForce(true).exec();
-            throw e;
         }
 
         final ComputerLauncher launcher = connector.createLauncher(api, containerId, remoteFs, listener);
-        DockerTransientNode node = new DockerTransientNode(containerId, remoteFs, launcher);
+
+        DockerTransientNode node = new DockerTransientNode(uid, containerId, remoteFs, launcher);
         node.setNodeDescription("Docker Agent [" + getImage() + " on "+ api.getDockerHost().getUri() + "]");
         node.setMode(mode);
         node.setLabelString(labelString);

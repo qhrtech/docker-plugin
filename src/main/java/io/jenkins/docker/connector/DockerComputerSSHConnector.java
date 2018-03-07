@@ -5,14 +5,12 @@ import com.cloudbees.plugins.credentials.CredentialsScope;
 import com.cloudbees.plugins.credentials.common.StandardUsernameCredentials;
 import com.github.dockerjava.api.command.CreateContainerCmd;
 import com.github.dockerjava.api.command.InspectContainerResponse;
-import com.github.dockerjava.api.model.ContainerNetwork;
 import com.github.dockerjava.api.model.ExposedPort;
 import com.github.dockerjava.api.model.NetworkSettings;
 import com.github.dockerjava.api.model.PortBinding;
 import com.github.dockerjava.api.model.Ports;
 import com.nirima.jenkins.plugins.docker.DockerTemplateBase;
 import com.nirima.jenkins.plugins.docker.utils.PortUtils;
-import com.trilead.ssh2.KnownHosts;
 import com.trilead.ssh2.signature.RSAKeyAlgorithm;
 import hudson.Extension;
 import hudson.model.AbstractDescribableImpl;
@@ -20,11 +18,9 @@ import hudson.model.Descriptor;
 import hudson.model.ItemGroup;
 import hudson.model.TaskListener;
 import hudson.plugins.sshslaves.SSHLauncher;
-import hudson.plugins.sshslaves.verifiers.HostKey;
 import hudson.plugins.sshslaves.verifiers.NonVerifyingKeyVerificationStrategy;
 import hudson.plugins.sshslaves.verifiers.SshHostKeyVerificationStrategy;
 import hudson.slaves.ComputerLauncher;
-import hudson.slaves.SlaveComputer;
 import hudson.util.ListBoxModel;
 import io.jenkins.docker.client.DockerAPI;
 import jenkins.bouncycastle.api.PEMEncodable;
@@ -46,10 +42,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.net.URI;
-import java.security.KeyPair;
-import java.security.KeyPairGenerator;
-import java.security.NoSuchAlgorithmException;
-import java.security.interfaces.RSAPublicKey;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.TimeUnit;
@@ -164,8 +156,8 @@ public class DockerComputerSSHConnector extends DockerComputerConnector {
             if (sshKeyStrategy.getInjectedKey() != null) {
                 cmd.withCmd("/usr/sbin/sshd", "-D", "-p", String.valueOf(port),
                         // override sshd_config to force retrieval of InstanceIdentity public for as authentication
-                        "-o", "AuthorizedKeysCommand /root/authorized_key",
-                        "-o", "AuthorizedKeysCommandUser root"
+                        "-o", "AuthorizedKeysCommand=/root/authorized_key",
+                        "-o", "AuthorizedKeysCommandUser=root"
                 );
             } else {
                 cmd.withCmd("/usr/sbin/sshd", "-D", "-p", String.valueOf(port));

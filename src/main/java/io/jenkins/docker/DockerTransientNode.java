@@ -7,7 +7,6 @@ import com.nirima.jenkins.plugins.docker.DockerOfflineCause;
 import com.nirima.jenkins.plugins.docker.strategy.DockerOnceRetentionStrategy;
 import hudson.model.Computer;
 import hudson.model.Descriptor;
-import hudson.model.Queue;
 import hudson.model.Slave;
 import hudson.model.TaskListener;
 import hudson.slaves.Cloud;
@@ -15,10 +14,8 @@ import hudson.slaves.ComputerLauncher;
 import io.jenkins.docker.client.DockerAPI;
 import jenkins.model.Jenkins;
 
-import javax.annotation.CheckForNull;
 import javax.annotation.Nonnull;
 import java.io.IOException;
-import java.io.Serializable;
 
 /**
  * A {@link Slave} node designed to be used only once for a build.
@@ -26,25 +23,38 @@ import java.io.Serializable;
  * @author <a href="mailto:nicolas.deloof@gmail.com">Nicolas De Loof</a>
  */
 public class DockerTransientNode extends Slave {
-    
+
+    //Keeping real containerId information, but using containerName as containerId
     private final String containerId;
-    
+
+    private final String containerName;
+
     private DockerAPI dockerAPI;
 
     private boolean removeVolumes;
 
     private String cloudId;
 
-    public DockerTransientNode(@Nonnull String containerId, String remoteFS, ComputerLauncher launcher) throws Descriptor.FormException, IOException {
-        super("docker-" + containerId.substring(0,12), remoteFS, launcher);
+
+    public DockerTransientNode(@Nonnull String uid, String containerId, String workdir, ComputerLauncher launcher) throws Descriptor.FormException, IOException {
+        super(nodeName(uid), workdir, launcher);
+        this.containerName = uid;
+        this.containerId = containerId;
         setNumExecutors(1);
         setMode(Mode.EXCLUSIVE);
         setRetentionStrategy(new DockerOnceRetentionStrategy(10));
-        this.containerId = containerId;
     }
 
-    public String getContainerId() {
+    public static String nodeName(@Nonnull String containerName) {
+        return "docker-" + containerName;
+    }
+
+    public String getContainerId(){
         return containerId;
+    }
+
+    public String getContainerName() {
+        return containerName;
     }
 
     public void setDockerAPI(DockerAPI dockerAPI) {
@@ -92,7 +102,7 @@ public class DockerTransientNode extends Slave {
         }
 
         Computer.threadPoolForRemoting.submit(() -> {
-
+            final String containerId = getContainerId();
             DockerClient client = dockerAPI.getClient();
 
             try {
