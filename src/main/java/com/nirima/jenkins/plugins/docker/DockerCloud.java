@@ -46,6 +46,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.TimeUnit;
 
 import static com.cloudbees.plugins.credentials.CredentialsMatchers.firstOrNull;
 import static com.cloudbees.plugins.credentials.CredentialsMatchers.withId;
@@ -60,7 +61,9 @@ public class DockerCloud extends Cloud {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(DockerCloud.class);
 
+    @CheckForNull
     private List<DockerTemplate> templates;
+    @CheckForNull
     private transient Map<Long, DockerTemplate> jobTemplates;
 
     @Deprecated
@@ -101,6 +104,7 @@ public class DockerCloud extends Cloud {
      */
     private boolean exposeDockerHost;
 
+    private @CheckForNull DockerDisabled disabled;
 
     @DataBoundConstructor
     public DockerCloud(String name,
@@ -206,12 +210,28 @@ public class DockerCloud extends Cloud {
     }
 
     /**
-     * Connects to Docker.
-     *
+     * Connects to Docker. <em>NOTE:</em> This should not be used for any
+     * long-running operations as the client it returns is not protected from
+     * closure.
+     * 
+     * @deprecated Use {@link #getDockerApi()} and then
+     *             {@link DockerAPI#getClient()} to get the client, followed by
+     *             a call to {@link DockerClient#close()}.
      * @return Docker client.
      */
-    public synchronized DockerClient getClient() {
-        return dockerApi.getClient();
+    @Deprecated
+    public DockerClient getClient() {
+        try {
+            // get a client
+            final DockerClient client = dockerApi.getClient();
+            // now release it so it'll be cached for a duration but will be
+            // reaped when the cache duration expires without anyone having to
+            // call anything else to make this happen.
+            client.close();
+            return client;
+        } catch (IOException ex) {
+            throw new RuntimeException(ex);
+        }
     }
 
     /**
@@ -281,6 +301,9 @@ public class DockerCloud extends Cloud {
 
     @Override
     public synchronized Collection<NodeProvisioner.PlannedNode> provision(final Label label, final int numberOfExecutorsRequired) {
+        if( getDisabled().isDisabled() ) {
+            return Collections.emptyList();
+        }
         try {
             LOGGER.info("Asked to provision {} slave(s) for: {}", numberOfExecutorsRequired, label);
 
@@ -288,23 +311,32 @@ public class DockerCloud extends Cloud {
             final List<DockerTemplate> templates = getTemplates(label);
             int remainingWorkload = numberOfExecutorsRequired;
 
+            // Take account of the executors that will result from the containers which we
+            // are already committed to starting but which have yet to be given to Jenkins
+            for ( final DockerTemplate t : templates ) {
+                final int numberOfContainersInProgress = countContainersInProgress(t);
+                final int numberOfExecutorsInProgress = t.getNumExecutors() * numberOfContainersInProgress;
+                remainingWorkload -= numberOfExecutorsInProgress;
+            }
+            if ( remainingWorkload != numberOfExecutorsRequired ) {
+                final int numberOfExecutorsInProgress = numberOfExecutorsRequired - remainingWorkload;
+                if( remainingWorkload<=0 ) {
+                    LOGGER.info("Not provisioning additional slaves for {}; we have {} executors being started already", label, numberOfExecutorsInProgress);
+                } else {
+                    LOGGER.info("Only provisioning {} slaves for {}; we have {} executors being started already", remainingWorkload, label, numberOfExecutorsInProgress);
+                }
+            }
+
             while (remainingWorkload > 0 && !templates.isEmpty()) {
                 final DockerTemplate t = templates.get(0); // get first
 
-                LOGGER.info("Will provision '{}', for label: '{}', in cloud: '{}'",
-                        t.getImage(), label, getDisplayName());
-
-                try {
-                    if (!canAddProvisionedSlave(t)) {
-                        templates.remove(t);
-                        continue;
-                    }
-                } catch (Exception e) {
-                    LOGGER.warn("Bad template '{}' in cloud '{}': '{}'. Trying next template...",
-                            t.getImage(), getDisplayName(), e.getMessage(), e);
+                final boolean thereIsCapacityToProvisionFromThisTemplate = canAddProvisionedSlave(t);
+                if (!thereIsCapacityToProvisionFromThisTemplate) {
                     templates.remove(t);
                     continue;
                 }
+                LOGGER.info("Will provision '{}', for label: '{}', in cloud: '{}'",
+                        t.getImage(), label, getDisplayName());
 
                 final CompletableFuture<Node> plannedNode = new CompletableFuture<>();
                 r.add(new NodeProvisioner.PlannedNode(t.getDisplayName(), plannedNode, t.getNumExecutors()));
@@ -312,10 +344,11 @@ public class DockerCloud extends Cloud {
                 final Runnable taskToCreateNewSlave = new Runnable() {
                     @Override
                     public void run() {
+                        DockerTransientNode slave = null;
                         try {
                             // TODO where can we log provisioning progress ?
                             final DockerAPI api = DockerCloud.this.getDockerApi();
-                            final DockerTransientNode slave = t.provisionNode(api, TaskListener.NULL);
+                            slave = t.provisionNode(api, TaskListener.NULL);
                             slave.setCloudId(DockerCloud.this.name);
                             plannedNode.complete(slave);
 
@@ -326,6 +359,9 @@ public class DockerCloud extends Cloud {
                             LOGGER.error("Error in provisioning; template='{}' for cloud='{}'",
                                     t, getDisplayName(), ex);
                             plannedNode.completeExceptionally(ex);
+                            if (slave != null) {
+                                slave.terminate(LOGGER);
+                            }
                             throw Throwables.propagate(ex);
                         } finally {
                             decrementContainersInProgress(t);
@@ -349,6 +385,9 @@ public class DockerCloud extends Cloud {
             return r;
         } catch (Exception e) {
             LOGGER.error("Exception while provisioning for label: '{}', cloud='{}'", label, getDisplayName(), e);
+            final DockerDisabled reasonForDisablement = getDisabled();
+            reasonForDisablement.disableBySystem("Cloud provisioning failure", TimeUnit.MINUTES.toMillis(5), e);
+            setDisabled(reasonForDisablement);
             return Collections.emptyList();
         }
     }
@@ -376,12 +415,15 @@ public class DockerCloud extends Cloud {
 
     @Override
     public boolean canProvision(Label label) {
+        if( getDisabled().isDisabled() ) {
+            return false;
+        }
         return getTemplate(label) != null;
     }
 
     @CheckForNull
     public DockerTemplate getTemplate(String template) {
-        for (DockerTemplate t : templates) {
+        for (DockerTemplate t : getTemplates()) {
             if (t.getImage().equals(template)) {
                 return t;
             }
@@ -406,6 +448,9 @@ public class DockerCloud extends Cloud {
      * Add a new template to the cloud
      */
     public synchronized void addTemplate(DockerTemplate t) {
+        if ( templates == null ) {
+            templates = new ArrayList<>();
+        }
         templates.add(t);
     }
 
@@ -440,9 +485,12 @@ public class DockerCloud extends Cloud {
      * @return Templates matched to requested label assuming slave Mode
      */
     public List<DockerTemplate> getTemplates(Label label) {
-        ArrayList<DockerTemplate> dockerTemplates = new ArrayList<>();
+        final List<DockerTemplate> dockerTemplates = new ArrayList<>();
 
-        for (DockerTemplate t : templates) {
+        for (DockerTemplate t : getTemplates()) {
+            if ( t.getDisabled().isDisabled() ) {
+                continue; // pretend it doesn't exist
+            }
             if (label == null && t.getMode() == Node.Mode.NORMAL) {
                 dockerTemplates.add(t);
             }
@@ -479,7 +527,9 @@ public class DockerCloud extends Cloud {
      * Remove Docker template
      */
     public synchronized void removeTemplate(DockerTemplate t) {
-        templates.remove(t);
+        if ( templates != null ) {
+            templates.remove(t);
+        }
     }
 
     /**
@@ -500,7 +550,10 @@ public class DockerCloud extends Cloud {
         if (imageName != null) {
             labelFilter.put(DockerTemplateBase.CONTAINER_LABEL_IMAGE, imageName);
         }
-        final List<?> containers = getClient().listContainersCmd().withLabelFilter(labelFilter).exec();
+        final List<?> containers;
+        try(final DockerClient client = dockerApi.getClient()) {
+            containers = client.listContainersCmd().withLabelFilter(labelFilter).exec();
+        }
         final int count = containers.size();
         return count;
     }
@@ -589,6 +642,7 @@ public class DockerCloud extends Cloud {
         sb.append(", dockerApi=").append(dockerApi);
         sb.append(", containerCap=").append(containerCap);
         sb.append(", exposeDockerHost=").append(exposeDockerHost);
+        sb.append(", disabled=").append(disabled);
         sb.append(", templates='").append(templates).append('\'');
         sb.append('}');
         return sb.toString();
@@ -603,6 +657,7 @@ public class DockerCloud extends Cloud {
         result = prime * result + containerCap;
         result = prime * result + ((templates == null) ? 0 : templates.hashCode());
         result = prime * result + (exposeDockerHost ? 1231 : 1237);
+        result = prime * result + getDisabled().hashCode();
         return result;
     }
 
@@ -618,13 +673,18 @@ public class DockerCloud extends Cloud {
         if (containerCap != that.containerCap) return false;
         if (templates != null ? !templates.equals(that.templates) : that.templates != null) return false;
         if (exposeDockerHost != that.exposeDockerHost)return false;
+        if (!getDisabled().equals(that.getDisabled())) return false;
         return true;
     }
 
     public boolean isTriton() {
-        Version remoteVersion = getClient().versionCmd().exec();
-
         if( _isTriton == null ) {
+            final Version remoteVersion;
+            try(final DockerClient client = dockerApi.getClient()) {
+                remoteVersion = client.versionCmd().exec();
+            } catch (IOException ex) {
+                throw new RuntimeException(ex);
+            }
             _isTriton = remoteVersion.getOperatingSystem().equals("solaris");
         }
         return _isTriton;
@@ -638,6 +698,15 @@ public class DockerCloud extends Cloud {
     @DataBoundSetter
     public void setExposeDockerHost(boolean exposeDockerHost) {
         this.exposeDockerHost = exposeDockerHost;
+    }
+
+    public DockerDisabled getDisabled() {
+        return disabled == null ? new DockerDisabled() : disabled;
+    }
+
+    @DataBoundSetter
+    public void setDisabled(DockerDisabled disabled) {
+        this.disabled = disabled;
     }
 
     public static List<DockerCloud> instances() {
@@ -664,7 +733,7 @@ public class DockerCloud extends Cloud {
     // unfortunately there's no common interface for Registry related Docker-java commands
 
     @Restricted(NoExternalUse.class)
-    public static void setRegistryAuthentication(PullImageCmd cmd, DockerRegistryEndpoint registry, ItemGroup context) throws IOException {
+    public static void setRegistryAuthentication(PullImageCmd cmd, DockerRegistryEndpoint registry, ItemGroup context) {
         if (registry != null && registry.getCredentialsId() != null) {
             AuthConfig auth = getAuthConfig(registry, context);
             cmd.withAuthConfig(auth);
@@ -672,7 +741,7 @@ public class DockerCloud extends Cloud {
     }
 
     @Restricted(NoExternalUse.class)
-    public static void setRegistryAuthentication(PushImageCmd cmd, DockerRegistryEndpoint registry, ItemGroup context) throws IOException {
+    public static void setRegistryAuthentication(PushImageCmd cmd, DockerRegistryEndpoint registry, ItemGroup context) {
         if (registry != null && registry.getCredentialsId() != null) {
             AuthConfig auth = getAuthConfig(registry, context);
             cmd.withAuthConfig(auth);
@@ -680,7 +749,7 @@ public class DockerCloud extends Cloud {
     }
 
     @Restricted(NoExternalUse.class)
-    public static AuthConfig getAuthConfig(DockerRegistryEndpoint registry, ItemGroup context) throws IOException {
+    public static AuthConfig getAuthConfig(DockerRegistryEndpoint registry, ItemGroup context) {
         AuthConfig auth = new AuthConfig();
 
         // we can't use DockerRegistryEndpoint#getToken as this one do check domainRequirement based on registry URL

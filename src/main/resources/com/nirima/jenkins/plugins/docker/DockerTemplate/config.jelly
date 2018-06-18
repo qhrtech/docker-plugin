@@ -5,6 +5,8 @@
         <f:textbox />
     </f:entry>
 
+    <f:property field="disabled"/>
+
     <f:property field="dockerTemplateBase"/>
 
 
@@ -29,6 +31,10 @@
 
     <f:entry title="${%Pull strategy}" field="pullStrategy">
         <f:enum>${it.description}</f:enum>
+    </f:entry>
+
+    <f:entry title="${%Pull timeout}" field="pullTimeout">
+        <f:number default="300"/>
     </f:entry>
 
     <f:entry title="Node Properties">
