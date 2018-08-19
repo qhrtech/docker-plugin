@@ -56,25 +56,6 @@ import static org.apache.commons.lang.StringUtils.trimToNull;
  */
 public class DockerTemplateBase implements Describable<DockerTemplateBase>, Serializable {
 
-    /**
-     * Name of the Docker "label" that we'll put into every container we start,
-     * setting its value to our {@link #getJenkinsInstanceIdForContainerLabel()}, so that we
-     * can recognize our own containers later.
-     */
-    static String CONTAINER_LABEL_JENKINS_INSTANCE_ID = "JenkinsId";
-    /**
-     * Name of the Docker "label" that we'll put into every container we start,
-     * setting its value to our {@link Jenkins#getRootUrl()}, so that we
-     * can recognize our own containers later.
-     */
-    static String CONTAINER_LABEL_JENKINS_URL = "JenkinsServerUrl";
-    /**
-     * Name of the Docker "label" that we'll put into every container we start,
-     * setting its value to our {@link #getImage()}, so that we
-     * can recognize our own containers later.
-     */
-    static String CONTAINER_LABEL_IMAGE = "JenkinsContainerImage";
-
     private final String image;
 
     private String pullCredentialsId;
@@ -116,6 +97,7 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
     public Integer memoryLimit;
     public Integer memorySwap;
     public Integer cpuShares;
+    public Integer shmSize;
 
     public boolean privileged;
     public boolean tty;
@@ -151,6 +133,7 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
                               Integer memoryLimit,
                               Integer memorySwap,
                               Integer cpuShares,
+                              Integer shmSize,
                               String bindPorts,
                               boolean bindAllPorts,
                               boolean privileged,
@@ -170,6 +153,7 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
         setMemoryLimit(memoryLimit);
         setMemorySwap(memorySwap);
         setCpuShares(cpuShares);
+        setShmSize(shmSize);
         setBindPorts(bindPorts);
         setBindAllPorts(bindAllPorts);
         setPrivileged(privileged);
@@ -359,6 +343,15 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
         this.cpuShares = cpuShares;
     }
 
+    public Integer getShmSize() {
+        return shmSize;
+    }
+
+    @DataBoundSetter
+    public void setShmSize(Integer shmSize) {
+        this.shmSize = shmSize;
+    }
+
     public boolean isPrivileged() {
         return privileged;
     }
@@ -488,9 +481,9 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
         containerConfig.withPrivileged(privileged);
 
         Map<String,String> map = new HashMap<>();
-        map.put(CONTAINER_LABEL_JENKINS_INSTANCE_ID, getJenkinsInstanceIdForContainerLabel());
-        map.put(CONTAINER_LABEL_JENKINS_URL, getJenkinsUrlForContainerLabel());
-        map.put(CONTAINER_LABEL_IMAGE, getImage());
+        map.put(DockerContainerLabelKeys.JENKINS_INSTANCE_ID, getJenkinsInstanceIdForContainerLabel());
+        map.put(DockerContainerLabelKeys.JENKINS_URL, getJenkinsUrlForContainerLabel());
+        map.put(DockerContainerLabelKeys.CONTAINER_IMAGE, getImage());
         
         HostConfig hostConfig = containerConfig.getHostConfig();
         hostConfig.withShmSize( 512L * 1024 * 1024 );
@@ -572,23 +565,29 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
             containerConfig.withExtraHosts(extraHosts.toArray(new String[extraHosts.size()]));
         }
 
+        if (shmSize != null && shmSize > 0) {
+            final Long shmSizeInByte = Long.valueOf(shmSize * 1024L * 1024L);
+            containerConfig.getHostConfig().withShmSize(shmSizeInByte);
+        }
+
         return containerConfig;
     }
 
 
     /**
      * Calculates the value we use for the Docker label called
-     * {@link #CONTAINER_LABEL_JENKINS_URL} that we put into every
+     * {@link DockerContainerLabelKeys#JENKINS_URL} that we put into every
      * container we make, so that we can recognize our own containers later.
      */
     static String getJenkinsUrlForContainerLabel() {
-        final String rootUrl = Jenkins.getInstance().getRootUrl();
+        final Jenkins jenkins = Jenkins.getInstance();
+        final String rootUrl = jenkins == null ? null : jenkins.getRootUrl();
         return Util.fixNull(rootUrl);
     }
 
     /**
      * Calculates the value we use for the Docker label called
-     * {@link #CONTAINER_LABEL_JENKINS_INSTANCE_ID} that we put into every
+     * {@link DockerContainerLabelKeys#JENKINS_INSTANCE_ID} that we put into every
      * container we make, so that we can recognize our own containers later.
      */
     static String getJenkinsInstanceIdForContainerLabel() {
@@ -624,6 +623,7 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
         sb.append(", memoryLimit=").append(memoryLimit);
         sb.append(", memorySwap=").append(memorySwap);
         sb.append(", cpuShares=").append(cpuShares);
+        sb.append(", shmSize=").append(shmSize);
         sb.append(", privileged=").append(privileged);
         sb.append(", tty=").append(tty);
         sb.append(", macAddress='").append(macAddress).append('\'');
@@ -658,6 +658,7 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
         if (memoryLimit != null ? !memoryLimit.equals(that.memoryLimit) : that.memoryLimit != null) return false;
         if (memorySwap != null ? !memorySwap.equals(that.memorySwap) : that.memorySwap != null) return false;
         if (cpuShares != null ? !cpuShares.equals(that.cpuShares) : that.cpuShares != null) return false;
+        if (shmSize != null ? !shmSize.equals(that.shmSize) : that.shmSize != null) return false;
         if (macAddress != null ? !macAddress.equals(that.macAddress) : that.macAddress != null) return false;
         return extraHosts != null ? extraHosts.equals(that.extraHosts) : that.extraHosts == null;
     }
@@ -679,6 +680,7 @@ public class DockerTemplateBase implements Describable<DockerTemplateBase>, Seri
         result = 31 * result + (memoryLimit != null ? memoryLimit.hashCode() : 0);
         result = 31 * result + (memorySwap != null ? memorySwap.hashCode() : 0);
         result = 31 * result + (cpuShares != null ? cpuShares.hashCode() : 0);
+        result = 31 * result + (shmSize != null ? shmSize.hashCode() : 0);
         result = 31 * result + (privileged ? 1 : 0);
         result = 31 * result + (tty ? 1 : 0);
         result = 31 * result + (macAddress != null ? macAddress.hashCode() : 0);

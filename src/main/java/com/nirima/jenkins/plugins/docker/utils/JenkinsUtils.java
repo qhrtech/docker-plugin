@@ -15,6 +15,8 @@ import hudson.slaves.Cloud;
 import io.jenkins.docker.DockerTransientNode;
 import jenkins.model.Jenkins;
 import org.jenkinsci.main.modules.instance_identity.InstanceIdentity;
+import org.kohsuke.accmod.Restricted;
+import org.kohsuke.accmod.restrictions.NoExternalUse;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -84,17 +86,19 @@ public class JenkinsUtils {
 
         Collection clouds = Collections2.filter(Jenkins.getInstance().clouds,
                 new Predicate<Cloud>() {
+                    @Override
                     public boolean apply(@Nullable Cloud input) {
                         return input instanceof DockerCloud;
                     }
                 });
 
-        return (Collection<DockerCloud>)clouds;
+        return clouds;
     }
 
     public static DockerCloud getServer(final String serverName) {
 
         return Iterables.find(getServers(), new Predicate<DockerCloud>() {
+            @Override
             public boolean apply(@Nullable DockerCloud input) {
                 return serverName.equals(input.getDisplayName());
             }
@@ -113,4 +117,76 @@ public class JenkinsUtils {
         }
         return _id;
     }
+
+    @Restricted(NoExternalUse.class)
+    public static void setTestInstanceId(final String id) {
+        _id = id;
+    }
+
+    /**
+     * returns the Java system property specified by <code>key</code>. If that fails, a default value is returned instead.
+     * 
+     * To be replaced with jenkins.util.SystemProperties.getString() once they lift their @Restricted(NoExternalUse.class)
+     * @param key the key of the system property to read.
+     * @param defaultValue the default value which shall be returned in case the property is not defined.
+     * @return the system property of <code>key</code>, or <code>defaultValue</code> in case the property is not defined.
+     */
+    @Restricted(NoExternalUse.class)
+    public static String getSystemPropertyString(String key, String defaultValue) {
+        String value = System.getProperty(key);
+        if (value == null) {
+            return defaultValue;
+        }
+        return value;
+    }
+
+    /**
+     * returns the Java system property specified by <code>key</code>. If that fails, a default value is returned instead.
+     * 
+     * In case the value of the system property cannot be parsed properly (e.g. a character was passed, causing a
+     * parsing error to occur), the default value is returned.
+     * 
+     * To be replaced with jenkins.util.SystemProperties.getLong() once they lift their @Restricted(NoExternalUse.class)
+     * @param key the key of the system property to read.
+     * @param defaultValue the default value which shall be returned in case the property is not defined.
+     * @return the system property of <code>key</code>, or <code>defaultValue</code> in case the property is not defined.
+     */
+    @Restricted(NoExternalUse.class)
+    public static Long getSystemPropertyLong(String key, Long defaultValue) {
+        String value = getSystemPropertyString(key, null);
+        if (value == null) {
+            return defaultValue;
+        }
+        Long longValue = null;
+        try {
+            longValue = Long.decode(value);
+        } catch (NumberFormatException e) {
+            LOG.warn("System property {} is attempted to be read as type Long, but value '{}' cannot be parsed as a number", key, value, e);
+            return defaultValue;
+        }
+        return longValue;
+    }
+
+    /**
+     * returns the Java system property specified by <code>key</code>. If that fails, a default value is returned instead.
+     * 
+     * In case the value of the system property cannot be parsed properly (e.g. an invalid identifier was passed), 
+     * the value <code>false</code> is returned.
+     * 
+     * To be replaced with jenkins.util.SystemProperties.getBoolean() once they lift their @Restricted(NoExternalUse.class)
+     * @param key the key of the system property to read.
+     * @param defaultValue the default value which shall be returned in case the property is not defined.
+     * @return the system property of <code>key</code>, or <code>defaultValue</code> in case the property is not defined.
+     */
+    @Restricted(NoExternalUse.class)
+    public static boolean getSystemPropertyBoolean(String key, boolean defaultValue) {
+        String value = getSystemPropertyString(key, null);
+        if (value == null) {
+            return defaultValue;
+        }
+        boolean booleanValue = false;
+        booleanValue = Boolean.parseBoolean(value);
+        return booleanValue;
+    }
+
 }

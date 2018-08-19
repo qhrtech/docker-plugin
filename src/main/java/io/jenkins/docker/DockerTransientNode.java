@@ -2,6 +2,7 @@ package io.jenkins.docker;
 
 import com.github.dockerjava.api.DockerClient;
 import com.github.dockerjava.api.exception.NotFoundException;
+import com.github.dockerjava.api.exception.NotModifiedException;
 import com.nirima.jenkins.plugins.docker.DockerCloud;
 import com.nirima.jenkins.plugins.docker.DockerOfflineCause;
 import com.nirima.jenkins.plugins.docker.strategy.DockerOnceRetentionStrategy;
@@ -33,8 +34,6 @@ public class DockerTransientNode extends Slave {
     //Keeping real containerId information, but using containerName as containerId
     private final String containerId;
 
-    private final String containerName;
-
     private transient DockerAPI dockerAPI;
 
     private boolean removeVolumes;
@@ -43,9 +42,8 @@ public class DockerTransientNode extends Slave {
 
     private AtomicBoolean acceptingTasks = new AtomicBoolean(true);
 
-    public DockerTransientNode(@Nonnull String uid, String containerId, String workdir, ComputerLauncher launcher) throws Descriptor.FormException, IOException {
-        super(nodeName(uid), workdir, launcher);
-        this.containerName = uid;
+    public DockerTransientNode(@Nonnull String nodeName, String containerId, String workdir, ComputerLauncher launcher) throws Descriptor.FormException, IOException {
+        super(nodeName, workdir, launcher);
         this.containerId = containerId;
         setNumExecutors(1);
         setMode(Mode.EXCLUSIVE);
@@ -61,16 +59,8 @@ public class DockerTransientNode extends Slave {
         this.acceptingTasks.set(acceptingTasks);
     }
 
-    public static String nodeName(@Nonnull String containerName) {
-        return "docker-" + containerName;
-    }
-
     public String getContainerId(){
         return containerId;
-    }
-
-    public String getContainerName() {
-        return containerName;
     }
 
     public void setDockerAPI(DockerAPI dockerAPI) {
@@ -151,6 +141,15 @@ public class DockerTransientNode extends Slave {
      */
     @Restricted(NoExternalUse.class)
     public void terminate(final Logger logger) {
+        final ILogger tl = createILoggerForSLF4JLogger(logger);
+        try {
+            terminate(tl);
+        } catch (Throwable ex) {
+            tl.error("Failure while terminating '" + name + "':", ex);
+        }
+    }
+
+    private static ILogger createILoggerForSLF4JLogger(final Logger logger) {
         final ILogger tl = new ILogger() {
             @Override
             public void println(String msg) {
@@ -162,64 +161,137 @@ public class DockerTransientNode extends Slave {
                 logger.error(msg, ex);
             }
         };
-        try {
-            terminate(tl);
-        } catch (Throwable ex) {
-            tl.error("Failure while terminating '" + name + "':", ex);
-        }
+        return tl;
     }
 
+    // terminate gets called multiple times, and the docker client logs noisy
+    // exceptions if we try to stop or remove a container twice.
+    private transient boolean containerStopped;
+    private transient boolean containerRemoved;
     private void terminate(ILogger logger) {
         try {
             final Computer computer = toComputer();
             if (computer != null) {
                 computer.disconnect(new DockerOfflineCause());
-                logger.println("Disconnected computer for slave '" + name + "'.");
+                logger.println("Disconnected computer for node '" + name + "'.");
             }
         } catch (Exception ex) {
-            logger.error("Can't disconnect computer for slave '" + name + "' due to exception:", ex);
+            logger.error("Can't disconnect computer for node '" + name + "' due to exception:", ex);
         }
 
         final String containerId = getContainerId();
         Computer.threadPoolForRemoting.submit(() -> {
-            final DockerAPI api;
-            try {
-                api = getDockerAPI();
-            } catch (RuntimeException ex) {
-                logger.error("Unable to stop and remove container '" + containerId + "' for slave '" + name + "' due to exception:", ex);
-                return;
-            }
-
-            try(final DockerClient client = api.getClient()) {
-                client.stopContainerCmd(containerId)
-                        .withTimeout(10)
-                        .exec();
-                logger.println("Stopped container '"+ containerId + "' for slave '" + name + "'.");
-            } catch(NotFoundException e) {
-                logger.println("Can't stop container '" + containerId + "' for slave '" + name + "' as it does not exist.");
-                return; // no point trying to remove the container if it's already gone.
-            } catch (Exception ex) {
-                logger.error("Failed to stop container '" + containerId + "' for slave '" + name + "' due to exception:", ex);
-            }
-
-            try(final DockerClient client = api.getClient()) {
-                client.removeContainerCmd(containerId)
-                        .withRemoveVolumes(removeVolumes)
-                        .exec();
-                logger.println("Removed container '" + containerId + "' for slave '" + name + "'.");
-            } catch (NotFoundException e) {
-                logger.println("Container '" + containerId + "' already gone for slave '" + name + "'.");
-            } catch (Exception ex) {
-                logger.error("Failed to remove container '" + containerId + "' for slave '" + name + "' due to exception:", ex);
+            synchronized(DockerTransientNode.this) {
+                if( containerRemoved ) {
+                    return; // nothing left to do here
+                }
+                final DockerAPI api;
+                try {
+                    api = getDockerAPI();
+                } catch (RuntimeException ex) {
+                    logger.error("Unable to stop and remove container '" + containerId + "' for node '" + name + "' due to exception:", ex);
+                    return;
+                }
+                final boolean newValues[] = stopAndRemoveContainer(api, logger, "for node '" + name + "'", removeVolumes, containerId, containerStopped);
+                containerStopped = newValues[0];
+                containerRemoved = newValues[1];
             }
         });
 
         try {
             Jenkins.getInstance().removeNode(this);
-            logger.println("Removed Node for slave '" + name + "'.");
+            logger.println("Removed Node for node '" + name + "'.");
         } catch (IOException ex) {
-            logger.error("Failed to remove Node for slave '" + name + "' due to exception:", ex);
+            logger.error("Failed to remove Node for node '" + name + "' due to exception:", ex);
         }
+    }
+
+    /**
+     * Removes a container, optionally stopping it first.
+     * 
+     * @return pair of booleans, first is true if the container is not running,
+     *         second is true if the container no longer exists.
+     */
+    private static boolean[] stopAndRemoveContainer(final DockerAPI api, final ILogger logger,
+            final String containerDescription, final boolean removeVolumes, final String containerId,
+            final boolean containerAlreadyStopped) {
+        boolean containerNowStopped = containerAlreadyStopped;
+        boolean containerNowRemoved = false;
+
+        try(final DockerClient client = api.getClient()) {
+            if( !containerNowStopped ) {
+                client.stopContainerCmd(containerId)
+                        .withTimeout(10)
+                        .exec();
+                containerNowStopped = true;
+                logger.println("Stopped container '"+ containerId + "' " + containerDescription + ".");
+            }
+        } catch(NotFoundException e) {
+            logger.println("Can't stop container '" + containerId + "' " + containerDescription + " as it does not exist.");
+            containerNowStopped = true;
+            containerNowRemoved = true; // no point trying to remove the container if it's already gone.
+        } catch(NotModifiedException e) {
+            logger.println("Container '" + containerId + "' already stopped" + containerDescription + ".");
+            containerNowStopped = true;
+        } catch (Exception ex) {
+            logger.error("Failed to stop container '" + containerId + "' " + containerDescription + " due to exception:", ex);
+        }
+
+        try(final DockerClient client = api.getClient()) {
+            if( !containerNowRemoved ) {
+                client.removeContainerCmd(containerId)
+                        .withRemoveVolumes(removeVolumes)
+                        .exec();
+                containerNowRemoved = true;
+                logger.println("Removed container '" + containerId + "' " + containerDescription + ".");
+            }
+        } catch (NotFoundException e) {
+            logger.println("Container '" + containerId + "' already gone " + containerDescription + ".");
+            containerNowRemoved = true;
+        } catch (Exception ex) {
+            logger.error("Failed to remove container '" + containerId + "' " + containerDescription + " due to exception:", ex);
+        }
+        return new boolean[]{
+                containerNowStopped,
+                containerNowRemoved
+        };
+    }
+
+    /**
+     * Utility method that gracefully terminates a docker container (preferably
+     * one that we started). Intended to only be used when we do not have a
+     * corresponding {@link DockerTransientNode} - if we have a
+     * {@link DockerTransientNode} then call
+     * {@link DockerTransientNode#terminate(Logger)} instead.
+     * 
+     * @param api
+     *            The {@link DockerAPI} which we are to use.
+     * @param logger
+     *            Where to log progress/results to.
+     * @param containerDescription
+     *            What the container was, e.g. "for slave node 'docker-1234'" or
+     *            "for non-existent node". Used in logs.
+     * @param removeVolumes
+     *            If true then we'll ask docker to remove the container's
+     *            volumes as well.
+     * @param containerId
+     *            The ID of the container to be terminated.
+     * @param containerAlreadyStopped
+     *            If true then we will assume that the container is already
+     *            stopped and not try to stop it again (which helps prevent
+     *            verbose warnings from appearing in the Jenkins log outside our
+     *            control). If you're not sure, pass in false.
+     * @return true if the container is now stopped and removed. false if we
+     *         could not remove it (in which case we will have logged the reason
+     *         why).
+     */
+    @Restricted(NoExternalUse.class)
+    public static boolean stopAndRemoveContainer(final DockerAPI api, final Logger logger, final String containerDescription,
+            final boolean removeVolumes, final String containerId, final boolean containerAlreadyStopped) {
+        final ILogger tl = createILoggerForSLF4JLogger(logger);
+        final boolean containerState[] = stopAndRemoveContainer(api, tl, containerDescription, removeVolumes,
+                containerId, containerAlreadyStopped);
+        return containerState[1];
     }
 
     public DockerCloud getCloud() {
